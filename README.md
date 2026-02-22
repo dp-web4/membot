@@ -191,6 +191,24 @@ The dashboard shows:
 
 The dashboard is a single-page app embedded in the server — no build step, no dependencies. It polls `/depot/status` every 2 seconds.
 
+## Web App
+
+Membot includes a user-facing search interface for browsing and storing memories from a browser.
+
+```
+https://your-server:8000/app
+```
+
+The app provides:
+- **Cartridge picker**: All available cartridges shown as clickable chips. Click to mount.
+- **Semantic search**: Type a query, get ranked results with scores and source tags
+- **Memory store**: Paste text with optional tags to add to the mounted cartridge
+- **Light/dark theme**: Toggle with localStorage persistence
+
+The app talks to the server through REST endpoints (`/api/status`, `/api/search`, `/api/cartridges`, `/api/mount`, `/api/store`). Like the depot, it's a single-page app embedded in the server with no external dependencies.
+
+A standalone version (`membot_app.html`) is also included for local development and testing. It connects to any Membot server via a configurable URL field.
+
 ### Behind a Reverse Proxy
 
 If you serve Membot behind nginx (e.g., at `/membot/`), the dashboard auto-detects its base path:
@@ -387,7 +405,8 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 
 ```
 membot/
-├── membot_server.py              # MCP server entry point + depot dashboard
+├── membot_server.py              # MCP server + depot dashboard + web app
+├── membot_app.html               # Standalone web app (connects to any server)
 ├── cartridge_builder.py          # CLI tool to build cartridges from documents
 ├── build_gutenberg_cartridge.py  # Download + embed 44 Project Gutenberg classics
 ├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine

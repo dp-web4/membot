@@ -50,6 +50,7 @@ import hashlib
 import pickle
 import zlib
 import time
+import base64
 import json
 import logging
 import argparse
@@ -518,17 +519,91 @@ async def rest_store(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
 async def rest_search(request: Request) -> JSONResponse:
-    """REST wrapper for memory_search — used by Heartbeat browser extension."""
+    """REST search returning structured JSON for browser apps."""
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
         data = await request.json()
-        result = memory_search.fn(
-            query=data.get("query", ""),
-            top_k=data.get("top_k", 5),
-            session_id=data.get("session_id", "")
-        )
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        query = data.get("query", "")
+        top_k = data.get("top_k", 5)
+        session_id = _resolve_session_id(data.get("session_id", ""))
+        state = _get_session(session_id)
+
+        if state["cartridge_name"] is None:
+            return JSONResponse({"status": "ok", "results": [], "error": "No cartridge mounted"}, headers=_cors_headers())
+        if state["embeddings"] is None or len(state["embeddings"]) == 0:
+            return JSONResponse({"status": "ok", "results": []}, headers=_cors_headers())
+
+        t0 = time.time()
+
+        # Embed query
+        query_emb = embed_text(query, prefix="search_query")
+
+        # Cosine similarity
+        stored = state["embeddings"]
+        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
+        query_norm = np.linalg.norm(query_emb) + 1e-9
+        emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
+
+        # Hamming blend
+        scores = emb_scores
+        if HAMMING_BLEND > 0 and state["binary_corpus"] is not None:
+            try:
+                q_bin = (query_emb > 0).astype(np.uint8)
+                corpus_bin = state["binary_corpus"]
+                n_bin = min(len(corpus_bin), len(emb_scores))
+                n_bits = corpus_bin.shape[1]
+                xor = np.bitwise_xor(q_bin, corpus_bin[:n_bin])
+                ham_scores = 1.0 - xor.sum(axis=1).astype(np.float32) / n_bits
+                blended = np.copy(emb_scores)
+                blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham_scores
+                scores = blended
+            except Exception:
+                pass
+
+        # Keyword reranking
+        STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
+                      "and", "or", "for", "on", "it", "be", "as", "at", "by", "this",
+                      "that", "with", "from", "not", "but", "has", "had", "have", "do",
+                      "does", "did", "will", "can", "its", "who", "what", "how", "why"}
+        keywords = [w for w in query.lower().split() if len(w) >= 3 and w not in STOP_WORDS]
+
+        candidate_k = min(max(top_k * 4, 20), len(scores))
+        candidate_idx = np.argsort(scores)[-candidate_k:][::-1]
+
+        boosted = []
+        for i in candidate_idx:
+            base_score = float(scores[i])
+            if base_score < 0.05:
+                continue
+            text_lower = state["texts"][i].lower()
+            hits = sum(1 for kw in keywords if kw in text_lower)
+            boost = min(hits * 0.03, 0.12)
+            boosted.append((i, base_score + boost))
+
+        boosted.sort(key=lambda x: x[1], reverse=True)
+        elapsed_ms = (time.time() - t0) * 1000
+
+        # Build structured results
+        results = []
+        for i, final_score in boosted[:top_k]:
+            if final_score < 0.1:
+                continue
+            text = state["texts"][i]
+            # Extract tags if text starts with [TAGS] prefix
+            tags = ""
+            if text.startswith("[") and "]" in text[:80]:
+                tag_end = text.index("]")
+                tags = text[1:tag_end]
+                text = text[tag_end + 1:].strip()
+            if len(text) > 500:
+                text = text[:500] + "..."
+            results.append({"text": text, "score": round(final_score, 4), "tags": tags, "index": int(i)})
+
+        state["query_count"] = state.get("query_count", 0) + 1
+        _log_activity(session_id, "search", f"'{query[:40]}' -> {len(results)} results", elapsed_ms)
+
+        return JSONResponse({"status": "ok", "results": results, "elapsed_ms": round(elapsed_ms)}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/search error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -536,13 +611,60 @@ async def rest_search(request: Request) -> JSONResponse:
 
 @mcp.custom_route("/api/status", methods=["GET", "OPTIONS"])
 async def rest_status(request: Request) -> JSONResponse:
-    """REST health check — returns mounted cartridge + memory count."""
+    """REST health check — returns structured cartridge status."""
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
-        result = get_status.fn()
+        sid = request.query_params.get("session_id", "")
+        sid = _resolve_session_id(sid)
+        state = _get_session(sid)
+        n = len(state["texts"]) if state["texts"] else 0
+        return JSONResponse({
+            "status": "ok",
+            "cartridge": state["cartridge_name"],
+            "memories": n,
+            "gpu": _gpu_state["available"],
+            "hamming": state["binary_corpus"] is not None,
+            "session_id": sid,
+        }, headers=_cors_headers())
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/cartridges", methods=["GET", "OPTIONS"])
+async def rest_cartridges(request: Request) -> JSONResponse:
+    """List available cartridges on disk."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        carts = find_cartridges()
+        return JSONResponse({
+            "status": "ok",
+            "cartridges": [
+                {"name": c["name"], "size_mb": c["size_mb"], "format": c["format"],
+                 "has_brain": c["has_brain"]}
+                for c in carts
+            ],
+        }, headers=_cors_headers())
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/mount", methods=["POST", "OPTIONS"])
+async def rest_mount(request: Request) -> JSONResponse:
+    """Mount a cartridge by name for the app session."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        name = data.get("name", "")
+        session_id = data.get("session_id", "")
+        if not name:
+            return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
+        result = mount_cartridge.fn(name=name, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
+        log.error(f"REST /api/mount error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
@@ -1011,6 +1133,280 @@ async function poll() {
 // Initial load + polling
 poll();
 setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# App frontend — user-facing search & store interface
+# ---------------------------------------------------------------------------
+
+# Load icon at import time (once)
+_icon_path = os.path.join(BASE_DIR, "membot-icon.png")
+if os.path.exists(_icon_path):
+    _app_icon_b64 = base64.b64encode(open(_icon_path, "rb").read()).decode()
+else:
+    _app_icon_b64 = ""
+
+@mcp.custom_route("/app", methods=["GET"])
+async def app_frontend(request: Request) -> HTMLResponse:
+    """Membot App — user-facing search & store interface."""
+    html = _APP_HTML.replace("{{ICON_DATA_URI}}",
+        f"data:image/png;base64,{_app_icon_b64}" if _app_icon_b64 else "")
+    return HTMLResponse(html)
+
+_APP_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Membot — Brain Cartridge Memory</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: #0c1017; --surface: #131a24; --surface-2: #1a2332;
+    --border: #1e2d3d; --border-hover: #2a3f54;
+    --text: #d1dae6; --text-dim: #6b7f95; --text-bright: #f0f4f8;
+    --accent: #3b82f6; --accent-dim: #2563eb; --accent-glow: #3b82f620;
+    --green: #22c55e; --green-dim: #16a34a; --green-glow: #22c55e18;
+    --amber: #eab308; --red: #ef4444;
+    --mono: 'Cascadia Code','Fira Code','JetBrains Mono','Consolas',monospace;
+    --sans: 'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+  }
+  [data-theme="light"] {
+    --bg: #f5f7fa; --surface: #ffffff; --surface-2: #f0f2f5;
+    --border: #e2e8f0; --border-hover: #cbd5e1;
+    --text: #334155; --text-dim: #94a3b8; --text-bright: #0f172a;
+    --accent: #3b82f6; --accent-dim: #2563eb; --accent-glow: #3b82f615;
+    --green: #16a34a; --green-dim: #15803d; --green-glow: #22c55e12;
+    --amber: #ca8a04; --red: #dc2626;
+  }
+  body { background:var(--bg); color:var(--text); font-family:var(--sans); font-size:14px; line-height:1.6; min-height:100vh; }
+  .app { max-width:960px; margin:0 auto; padding:20px; }
+  .brand { display:flex; align-items:center; gap:14px; padding:24px 0 20px; border-bottom:1px solid var(--border); margin-bottom:24px; }
+  .brand-icon { width:48px; height:48px; border-radius:12px; overflow:hidden; flex-shrink:0; box-shadow:0 4px 20px #3b82f630; }
+  .brand-icon img { width:100%; height:100%; object-fit:cover; }
+  .brand-text h1 { font-size:22px; font-weight:700; color:var(--text-bright); letter-spacing:-0.5px; }
+  .brand-text h1 span { color:var(--accent); }
+  .brand-text p { font-size:12px; color:var(--text-dim); margin-top:-2px; }
+  .theme-toggle { background:var(--surface); border:1px solid var(--border); color:var(--text-dim); width:36px; height:36px; border-radius:8px; cursor:pointer; font-size:18px; display:flex; align-items:center; justify-content:center; transition:all 0.2s; flex-shrink:0; margin-left:auto; }
+  .theme-toggle:hover { border-color:var(--border-hover); color:var(--text); }
+  [data-theme="light"] .result-card, [data-theme="light"] .cart-chip { box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+  .status-bar { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-dim); }
+  .status-dot { width:10px; height:10px; border-radius:50%; background:var(--text-dim); transition:all 0.3s; }
+  .status-dot.connected { background:var(--green); box-shadow:0 0 8px var(--green-glow); }
+  .status-dot.error { background:var(--red); }
+  .cart-bar { display:flex; gap:10px; margin-bottom:20px; overflow-x:auto; padding-bottom:4px; align-items:center; }
+  .cart-chip { flex-shrink:0; background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px 16px; min-width:140px; transition:all 0.2s; cursor:pointer; }
+  .cart-chip:hover { border-color:var(--border-hover); transform:translateY(-1px); }
+  .cart-chip.active { border-color:var(--accent); background:var(--accent-glow); cursor:default; }
+  .cart-chip.mounting { opacity:0.6; pointer-events:none; }
+  .cart-chip .name { font-size:13px; font-weight:600; color:var(--text-bright); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cart-chip .meta { font-size:11px; color:var(--text-dim); margin-top:2px; }
+  .cart-chip .meta .count { color:var(--accent); font-weight:600; }
+  .search-box { position:relative; display:flex; gap:8px; margin-bottom:8px; }
+  .search-box input { flex:1; background:var(--surface); border:1px solid var(--border); color:var(--text-bright); font-size:15px; padding:12px 16px 12px 42px; border-radius:10px; outline:none; transition:all 0.2s; font-family:var(--sans); }
+  .search-box input:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-glow); }
+  .search-box input::placeholder { color:var(--text-dim); }
+  .search-icon { position:absolute; left:14px; top:50%; transform:translateY(-50%); color:var(--text-dim); font-size:16px; pointer-events:none; }
+  .search-box button { background:var(--accent); color:white; border:none; padding:12px 24px; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer; transition:all 0.2s; white-space:nowrap; }
+  .search-box button:hover { background:var(--accent-dim); }
+  .search-meta { display:flex; justify-content:space-between; font-size:12px; color:var(--text-dim); margin-bottom:16px; }
+  .results { display:flex; flex-direction:column; gap:12px; }
+  .result-card { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 20px; transition:all 0.2s; }
+  .result-card:hover { border-color:var(--border-hover); }
+  .result-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+  .result-rank { font-size:11px; font-weight:700; color:var(--accent); background:var(--accent-glow); padding:2px 8px; border-radius:4px; font-family:var(--mono); }
+  .result-score { font-size:11px; color:var(--text-dim); font-family:var(--mono); }
+  .result-text { font-size:13px; line-height:1.7; color:var(--text); white-space:pre-wrap; word-break:break-word; }
+  .result-text mark { background:#eab30830; color:var(--amber); border-radius:2px; padding:0 2px; }
+  .result-footer { margin-top:10px; padding-top:8px; border-top:1px solid var(--border); display:flex; gap:12px; font-size:11px; color:var(--text-dim); font-family:var(--mono); }
+  .result-footer .tag { background:var(--surface-2); padding:1px 6px; border-radius:3px; }
+  .store-section { margin-top:32px; padding-top:24px; border-top:1px solid var(--border); }
+  .store-section h2 { font-size:14px; font-weight:600; color:var(--text-bright); margin-bottom:12px; }
+  .store-box textarea { width:100%; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:13px; font-family:var(--sans); padding:12px 16px; border-radius:10px; resize:vertical; min-height:100px; outline:none; transition:border-color 0.2s; margin-bottom:8px; }
+  .store-box textarea:focus { border-color:var(--green); }
+  .store-box textarea::placeholder { color:var(--text-dim); }
+  .store-row { display:flex; gap:8px; align-items:center; }
+  .store-row input { flex:1; background:var(--surface); border:1px solid var(--border); color:var(--text); font-size:12px; padding:8px 12px; border-radius:8px; outline:none; font-family:var(--mono); }
+  .store-row input:focus { border-color:var(--green); }
+  .store-row input::placeholder { color:var(--text-dim); }
+  .store-row button { background:var(--green); color:white; border:none; padding:8px 20px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; transition:all 0.2s; }
+  .store-row button:hover { background:var(--green-dim); }
+  .toast { position:fixed; bottom:24px; right:24px; background:var(--surface-2); border:1px solid var(--border); border-radius:8px; padding:12px 20px; font-size:13px; color:var(--text); box-shadow:0 8px 32px #00000060; transform:translateY(80px); opacity:0; transition:all 0.3s; z-index:1000; }
+  .toast.show { transform:translateY(0); opacity:1; }
+  .toast.success { border-left:3px solid var(--green); }
+  .toast.error { border-left:3px solid var(--red); }
+  .empty-state { text-align:center; padding:60px 20px; color:var(--text-dim); }
+  .empty-state .icon { font-size:48px; margin-bottom:12px; opacity:0.3; }
+  .loading { display:none; text-align:center; padding:40px; color:var(--text-dim); }
+  .loading.active { display:block; }
+  .spinner { display:inline-block; width:20px; height:20px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .app-footer { margin-top:40px; padding:20px 0; border-top:1px solid var(--border); text-align:center; font-size:11px; color:var(--text-dim); }
+  .app-footer a { color:var(--accent); text-decoration:none; }
+  .app-footer a:hover { text-decoration:underline; }
+  @media (max-width:640px) { .app { padding:12px; } .brand { flex-wrap:wrap; } .search-box { flex-direction:column; } .search-box button { width:100%; } }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="brand">
+    <div class="brand-icon"><img src="{{ICON_DATA_URI}}" alt="Membot"></div>
+    <div class="brand-text">
+      <h1>Mem<span>bot</span></h1>
+      <p>Brain Cartridge Memory System</p>
+    </div>
+    <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()" title="Toggle light/dark">&#x2600;</button>
+    <div class="status-bar" id="statusBar">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Connecting...</span>
+    </div>
+  </div>
+  <div class="cart-bar" id="cartBar"><div class="cart-chip"><div class="name" style="color:var(--text-dim)">Loading...</div></div></div>
+  <div class="search-box">
+    <span class="search-icon">&#x1F50D;</span>
+    <input type="text" id="searchInput" placeholder="Search your memory..." onkeydown="if(event.key==='Enter')doSearch()">
+    <button onclick="doSearch()">Search</button>
+  </div>
+  <div class="search-meta" id="searchMeta"></div>
+  <div class="loading" id="loadingEl"><div class="spinner"></div> Searching...</div>
+  <div class="results" id="resultsEl">
+    <div class="empty-state"><div class="icon">&#x1F9E0;</div><p>Search your brain cartridge</p><div class="hint" style="font-size:12px;margin-top:8px">Type a query to find memories by meaning</div></div>
+  </div>
+  <div class="store-section">
+    <h2>Store a Memory</h2>
+    <div class="store-box">
+      <textarea id="storeContent" placeholder="Paste or type content to store..." rows="4"></textarea>
+      <div class="store-row">
+        <input type="text" id="storeTags" placeholder="Tags (optional): ARCHITECTURE, JOURNAL, ...">
+        <button onclick="doStore()">Store</button>
+      </div>
+    </div>
+  </div>
+  <div class="app-footer">Membot &mdash; Neuromorphic memory for AI agents &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></div>
+</div>
+<div class="toast" id="toastEl"></div>
+<script>
+const $=s=>document.querySelector(s);
+let _mounted=null, _memories=0;
+const BASE=()=>{
+  const loc=location.pathname.replace(/\\/app\\/?$/,'');
+  return location.protocol==='file:'?'http://137.184.227.79:8000':location.origin+loc;
+};
+async function checkStatus(){
+  const dot=$('#statusDot'),txt=$('#statusText');
+  try{
+    const r=await fetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    dot.className='status-dot connected';
+    _mounted=d.cartridge; _memories=d.memories||0;
+    txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
+  }catch(e){ dot.className='status-dot error'; txt.textContent='Disconnected'; }
+}
+async function loadCartridges(){
+  const bar=$('#cartBar');
+  try{
+    const [cr,sr]=await Promise.all([
+      fetch(BASE()+'/api/cartridges',{signal:AbortSignal.timeout(5000)}).then(r=>r.json()),
+      fetch(BASE()+'/api/status',{signal:AbortSignal.timeout(5000)}).then(r=>r.json())
+    ]);
+    _mounted=sr.cartridge; _memories=sr.memories||0;
+    const dot=$('#statusDot'),txt=$('#statusText');
+    dot.className='status-dot connected';
+    txt.textContent=(_mounted||'No cart')+' ('+_memories.toLocaleString()+' memories)';
+    const carts=cr.cartridges||[];
+    if(carts.length===0){bar.innerHTML='<div class="cart-chip"><div class="name" style="color:var(--text-dim)">No cartridges found</div></div>';return;}
+    bar.innerHTML=carts.map(c=>{
+      const active=_mounted&&c.name===_mounted;
+      const cls='cart-chip'+(active?' active':'');
+      const mem=active?' &middot; <span class="count">'+_memories.toLocaleString()+' memories</span>':'';
+      return '<div class="'+cls+'" data-name="'+esc(c.name)+'"><div class="name">'+esc(c.name)+'</div><div class="meta">'+c.size_mb+' MB &middot; '+c.format.toUpperCase()+(c.has_brain?' &middot; GPU':'')+mem+'</div></div>';
+    }).join('');
+    bar.querySelectorAll('.cart-chip').forEach(el=>el.addEventListener('click',()=>mountCart(el.dataset.name)));
+  }catch(e){bar.innerHTML='<div class="cart-chip"><div class="name" style="color:var(--red)">Connection failed</div></div>';}
+}
+async function mountCart(name){
+  if(name===_mounted)return;
+  const chips=document.querySelectorAll('.cart-chip');
+  chips.forEach(c=>{if(c.dataset.name===name)c.classList.add('mounting');});
+  toast('Mounting '+name+'...');
+  try{
+    const r=await fetch(BASE()+'/api/mount',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+    const d=await r.json();
+    if(d.error){toast(d.error,'error');}
+    else{toast('Mounted '+name,'success');}
+    await loadCartridges();
+  }catch(e){toast('Mount failed: '+e.message,'error');chips.forEach(c=>c.classList.remove('mounting'));}
+}
+async function doSearch(){
+  const query=$('#searchInput').value.trim();
+  if(!query)return;
+  const el=$('#resultsEl'),loading=$('#loadingEl'),meta=$('#searchMeta');
+  el.innerHTML=''; loading.className='loading active'; meta.textContent='';
+  const t0=performance.now();
+  try{
+    const r=await fetch(BASE()+'/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,top_k:8})});
+    const data=await r.json();
+    const elapsed=Math.round(performance.now()-t0);
+    loading.className='loading';
+    var items=data.results;
+    if(!items&&typeof data.result==='string'){
+      items=[];
+      var lines=data.result.split(/\\n\\n/);
+      for(var li=0;li<lines.length;li++){
+        var m=lines[li].match(/^#\\d+\\s+\\[([\\d.]+)\\]\\s+(.*)/s);
+        if(m)items.push({score:parseFloat(m[1]),text:m[2],tags:''});
+      }
+    }
+    if(!items||items.length===0){
+      el.innerHTML='<div class="empty-state"><div class="icon">&#x1F914;</div><p>No results found</p></div>';
+      meta.textContent='0 results in '+elapsed+'ms'; return;
+    }
+    meta.textContent=items.length+' results in '+elapsed+'ms';
+    el.innerHTML=items.map((item,i)=>{
+      const text=esc(item.text||item.content||'');
+      const score=item.score!=null?item.score.toFixed(4):'';
+      const tags=item.tags?item.tags.split(',').map(t=>'<span class="tag">'+esc(t.trim())+'</span>').join(''):'';
+      return '<div class="result-card"><div class="result-header"><span class="result-rank">#'+(i+1)+'</span>'+(score?'<span class="result-score">score: '+score+'</span>':'')+'</div><div class="result-text">'+highlight(text,query)+'</div>'+(tags?'<div class="result-footer">'+tags+'</div>':'')+'</div>';
+    }).join('');
+  }catch(e){ loading.className='loading'; el.innerHTML='<div class="empty-state"><div class="icon">&#x26A0;</div><p>Search failed</p><div style="font-size:12px;margin-top:8px">'+esc(e.message)+'</div></div>'; }
+}
+async function doStore(){
+  const content=$('#storeContent').value.trim();
+  const tags=$('#storeTags').value.trim();
+  if(!content){toast('Enter content to store','error');return;}
+  try{
+    const r=await fetch(BASE()+'/api/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,tags})});
+    const data=await r.json();
+    if(data.error){toast(data.error,'error');}
+    else{toast('Memory stored','success');$('#storeContent').value='';$('#storeTags').value='';checkStatus();}
+  }catch(e){toast('Store failed: '+e.message,'error');}
+}
+function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function highlight(text,query){
+  if(!query)return text;
+  const words=query.split(/\\s+/).filter(w=>w.length>2);
+  let r=text;
+  for(const w of words){const re=new RegExp('('+w.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')+')','gi');r=r.replace(re,'<mark>$1</mark>');}
+  return r;
+}
+function toast(msg,type='success'){
+  const el=$('#toastEl');el.textContent=msg;el.className='toast '+type+' show';
+  setTimeout(()=>el.className='toast',3000);
+}
+function toggleTheme(){
+  const html=document.documentElement;
+  const next=html.getAttribute('data-theme')==='light'?'dark':'light';
+  html.setAttribute('data-theme',next);
+  $('#themeBtn').innerHTML=next==='light'?'&#x1F319;':'&#x2600;';
+  localStorage.setItem('membot-theme',next);
+}
+(function(){const s=localStorage.getItem('membot-theme');if(s==='light'){document.documentElement.setAttribute('data-theme','light');setTimeout(()=>$('#themeBtn').innerHTML='&#x1F319;',0);}})();
+loadCartridges();
 </script>
 </body>
 </html>
