@@ -29,16 +29,16 @@ POETRY = [
     (8800, "Songs of Innocence and Experience", "William Blake", "romantic,innocence,experience,visionary"),
     (574, "Poems", "John Keats", "romantic,beauty,mortality,nature"),
     (4800, "The Complete Poetical Works of Percy Bysshe Shelley", "Percy Shelley", "romantic,liberty,nature,imagination"),
-    (8601, "Poems of William Wordsworth", "William Wordsworth", "romantic,nature,memory,childhood"),
+    (12145, "The Poetical Works of William Wordsworth", "William Wordsworth", "romantic,nature,memory,childhood"),
     (7242, "Poems of Coleridge", "Samuel Taylor Coleridge", "romantic,supernatural,imagination,dream"),
     (21700, "The Works of Lord Byron", "Lord Byron", "romantic,passion,freedom,exile"),
 
     # Victorian
-    (8601, "Poems of Tennyson", "Alfred Lord Tennyson", "victorian,loss,duty,nature"),
+    (8601, "The Early Poems of Alfred Lord Tennyson", "Alfred Lord Tennyson", "victorian,loss,duty,nature"),
     (9006, "Sonnets from the Portuguese", "Elizabeth Barrett Browning", "love,sonnets,devotion,victorian"),
-    (4697, "Poems", "Christina Rossetti", "devotion,death,nature,longing"),
+    (19188, "Poems", "Christina Rossetti", "devotion,death,nature,longing"),
     (730, "Poems", "Emily Dickinson", "death,nature,immortality,solitude"),
-    (264, "Goblin Market", "Christina Rossetti", "temptation,sisterhood,fairy-tale,victorian"),
+    (16950, "Goblin Market, The Prince's Progress, and Other Poems", "Christina Rossetti", "temptation,sisterhood,fairy-tale,victorian"),
 
     # American voices
     (1322, "Leaves of Grass", "Walt Whitman", "democracy,self,nature,america"),
@@ -72,14 +72,20 @@ POETRY = [
     (1321, "Spoon River Anthology", "Edgar Lee Masters", "death,small-town,epitaphs,america"),
     (601, "The Congo and Other Poems", "Vachel Lindsay", "rhythm,america,race,performance"),
 
+    # European (English translations)
+    (38594, "Poems", "Rainer Maria Rilke", "german,solitude,angels,transformation"),
+
+    # e.e. cummings
+    (77021, "Is 5", "e.e. cummings", "modern,experimental,typography,love"),
+
     # Women's voices
-    (11, "Poems", "Amy Lowell", "imagism,nature,love,form"),
-    (1079, "Poems", "Sara Teasdale", "love,beauty,solitude,nature"),
-    (4725, "Poems", "Edna St. Vincent Millay", "love,feminism,mortality,sonnets"),
+    (261, "A Dome of Many-Coloured Glass", "Amy Lowell", "imagism,nature,love,form"),
+    (442, "Love Songs", "Sara Teasdale", "love,beauty,solitude,nature"),
+    (109, "Renascence, and Other Poems", "Edna St. Vincent Millay", "love,feminism,mortality,sonnets"),
 ]
 
-# Some IDs above are placeholders — we'll validate during download.
-# Real Gutenberg IDs can be looked up at gutenberg.org.
+# All IDs verified against gutenberg.org (2026-02-22).
+# Rimbaud omitted — French only on Gutenberg, no English translation available.
 
 
 # ============================================================
