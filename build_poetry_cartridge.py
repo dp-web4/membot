@@ -72,8 +72,12 @@ POETRY = [
     (1321, "Spoon River Anthology", "Edgar Lee Masters", "death,small-town,epitaphs,america"),
     (601, "The Congo and Other Poems", "Vachel Lindsay", "rhythm,america,race,performance"),
 
-    # European (English translations)
+    # European
     (38594, "Poems", "Rainer Maria Rilke", "german,solitude,angels,transformation"),
+
+    # French (original language — agents can handle it)
+    (29302, "Poesies completes", "Arthur Rimbaud", "french,symbolist,rebellion,vision"),
+    (6099, "Les Fleurs du Mal", "Charles Baudelaire", "french,symbolist,decadence,beauty,death"),
 
     # e.e. cummings
     (77021, "Is 5", "e.e. cummings", "modern,experimental,typography,love"),
@@ -85,7 +89,8 @@ POETRY = [
 ]
 
 # All IDs verified against gutenberg.org (2026-02-22).
-# Rimbaud omitted — French only on Gutenberg, no English translation available.
+# Lovecraft: scattered verse in amateur journalism (ID 30637) but no poetry collection.
+# Lord Dunsany: prose and plays only on Gutenberg, no verse collections.
 
 
 # ============================================================

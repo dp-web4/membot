@@ -153,10 +153,14 @@ def get_embedder():
     return _embed_model
 
 
-def embed_texts(texts: list[str], batch_size: int = 64) -> np.ndarray:
-    """Embed a list of texts using Nomic."""
+def embed_texts(texts: list[str], batch_size: int = 32) -> np.ndarray:
+    """Embed a list of texts using Nomic.
+
+    Truncates passages to ~8000 chars (~2000 tokens) to stay within
+    Nomic's 2048-token context and avoid GPU OOM on long poetry passages.
+    """
     model = get_embedder()
-    prefixed = [f"search_document: {t}" for t in texts]
+    prefixed = [f"search_document: {t[:8000]}" for t in texts]
     embeddings = model.encode(prefixed, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True)
     return embeddings.astype(np.float32)
 
