@@ -319,6 +319,7 @@ def main():
     print(f"{'='*60}\n")
 
     all_passages = []
+    doc_map = []  # (source_name, chunk_index, total_chunks) per passage
     books_ok = 0
     books_failed = 0
 
@@ -354,6 +355,11 @@ def main():
         else:
             method = "poem-split"
 
+        # Track source for hippocampus linking
+        source_name = f"{author} - {title}"
+        for i, poem in enumerate(poems):
+            doc_map.append((source_name, i, len(poems)))
+
         all_passages.extend(poems)
         books_ok += 1
         print(f"  {title} ({author}): {len(poems)} passages ({method}), {len(cleaned):,} chars")
@@ -363,6 +369,7 @@ def main():
         step = len(all_passages) / args.max_passages
         indices = [int(i * step) for i in range(args.max_passages)]
         all_passages = [all_passages[i] for i in indices]
+        doc_map = [doc_map[i] for i in indices]
 
     print(f"\nPhase 1 complete: {books_ok} collections, {books_failed} failed, {len(all_passages):,} passages")
 
@@ -377,9 +384,20 @@ def main():
     embed_time = time.time() - t0
     print(f"Embedded in {embed_time:.1f}s ({len(all_passages)/embed_time:.0f} passages/sec)")
 
+    # Build hippocampus metadata (PREV/NEXT links within each book)
+    print(f"\nPhase 2.5: Building hippocampus metadata...")
+    from cartridge_builder import build_metadata
+    metadata, pattern0 = build_metadata(all_passages, doc_map, cart_name=args.name, creator="Gutenberg Poetry Builder")
+    n_linked = sum(1 for m in metadata if m[6:10] != b'\x00\x00\x00\x00' or m[10:14] != b'\x00\x00\x00\x00')
+    n_books = len(set(fn for fn, _, _ in doc_map))
+    print(f"  {len(metadata)} entries from {n_books} books, {n_linked} with PREV/NEXT links")
+
     # Save
     print(f"\nPhase 3: Saving cartridge '{args.name}'...")
-    cart_path, size_mb, fingerprint = save_cartridge(output_dir, args.name, embeddings, all_passages)
+    cart_path, size_mb, fingerprint = save_cartridge(
+        output_dir, args.name, embeddings, all_passages,
+        metadata=metadata, pattern0=pattern0,
+    )
     print(f"Saved: {cart_path} ({size_mb:.1f} MB, {fingerprint})")
 
     # Optional training

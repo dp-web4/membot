@@ -46,6 +46,7 @@ from fastmcp import FastMCP
 import os
 import sys
 import re
+import struct
 import hashlib
 import pickle
 import zlib
@@ -179,6 +180,7 @@ def _new_session() -> dict:
         "texts": [],              # list[str]
         "binary_corpus": None,    # (N, 768) uint8 — sign_zero encoding for Hamming search
         "signatures": None,       # (N, 4096) float32 or None (legacy, not used in search)
+        "hippocampus": None,      # list[dict] — per-passage metadata (prev/next/flags/etc.)
         "lattice": None,          # CUDA wrapper or None
         "gpu_available": False,
         "modified": False,        # True if memory_store was called since last save
@@ -441,6 +443,12 @@ def load_npz_cartridge(path: str) -> dict:
     else:
         result["texts"] = []
 
+    # Load hippocampus metadata if present (mcp-v4+)
+    if "hippocampus" in data:
+        result["hippocampus"] = _unpack_hippocampus(data["hippocampus"])
+    else:
+        result["hippocampus"] = None
+
     return result
 
 
@@ -465,6 +473,38 @@ def load_signatures(path: str) -> dict:
     if "titles" in data:
         result["titles"] = [str(t) for t in data["titles"]]
 
+    return result
+
+
+# --- Hippocampus metadata struct (matches cartridge_builder.py) ---
+_HIPPO_FORMAT = '<I B B I I I I H I B 35s'
+_HIPPO_SIZE = 64
+
+def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
+    """Unpack hippocampus metadata array into list of dicts.
+
+    Args:
+        raw: (N, 64) uint8 array from NPZ 'hippocampus' key
+
+    Returns:
+        List of dicts with: pattern_id, format_version, cartridge_type,
+        prev, next, sibling, source_hash, sequence_num, timestamp, flags
+    """
+    result = []
+    for row in raw:
+        vals = struct.unpack(_HIPPO_FORMAT, row.tobytes())
+        result.append({
+            "pattern_id":     vals[0],
+            "format_version": vals[1],
+            "cartridge_type": vals[2],
+            "prev":           vals[3] if vals[3] > 0 else None,
+            "next":           vals[4] if vals[4] > 0 else None,
+            "sibling":        vals[5] if vals[5] > 0 else None,
+            "source_hash":    vals[6],
+            "sequence_num":   vals[7],
+            "timestamp":      vals[8],
+            "flags":          vals[9],
+        })
     return result
 
 
@@ -1550,6 +1590,7 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["cartridge_name"] = cart["name"]
         state["cartridge_path"] = cart["path"]
         state["signatures"] = None
+        state["hippocampus"] = data.get("hippocampus")
         state["modified"] = False
 
         # Compute sign_zero binary corpus for Hamming search (96 bytes per pattern)
@@ -1587,9 +1628,14 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
                 gpu_msg = f", brain load failed: {e}"
                 log.warning(f"Brain load failed: {e}")
 
+        hippo_msg = ""
+        if state["hippocampus"]:
+            n_linked = sum(1 for h in state["hippocampus"] if h.get("prev") or h.get("next"))
+            hippo_msg = f", hippocampus={len(state['hippocampus'])} ({n_linked} linked)"
+
         state["mount_count"] = state.get("mount_count", 0) + 1
         _log_activity(session_id, "mount", cart['name'], elapsed_ms)
-        return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}. Session: {session_id}"
+        return f"Mounted '{cart['name']}': {n} memories, {dim}-dim, {data['format'].upper()}, integrity={verify_msg}{gpu_msg}{hippo_msg}. Session: {session_id}"
 
     except PermissionError as e:
         log.error(f"Security block: {e}")
@@ -1693,7 +1739,8 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
 
         elapsed_ms = (time.time() - t0) * 1000
 
-        # 5. Format results
+        # 5. Format results (include passage index + nav hints if hippocampus present)
+        hippo = state.get("hippocampus")
         results = []
         for rank, (i, final_score, kw_boost) in enumerate(boosted[:top_k], 1):
             if final_score < 0.1:
@@ -1701,13 +1748,24 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
             text = state["texts"][i]
             if len(text) > 500:
                 text = text[:500] + "..."
+
+            # Nav hint from hippocampus
+            nav = ""
+            if hippo and i < len(hippo):
+                h = hippo[i]
+                parts = []
+                if h.get("prev"): parts.append(f"prev=#{h['prev']-1}")
+                if h.get("next"): parts.append(f"next=#{h['next']-1}")
+                if parts:
+                    nav = f" [{' '.join(parts)}]"
+
             if verbose:
                 cos_s = f"{float(emb_scores[i]):.3f}"
                 ham_s = f"{float(ham_scores[i]):.3f}" if ham_scores is not None and i < len(ham_scores) else "—"
                 kw_s = f"+{kw_boost:.3f}" if kw_boost > 0 else "—"
-                results.append(f"#{rank} [{final_score:.3f}] cos={cos_s} ham={ham_s} kw={kw_s}\n{text}")
+                results.append(f"#{rank} (idx:{i}) [{final_score:.3f}] cos={cos_s} ham={ham_s} kw={kw_s}{nav}\n{text}")
             else:
-                results.append(f"#{rank} [{final_score:.3f}] {text}")
+                results.append(f"#{rank} (idx:{i}) [{final_score:.3f}]{nav} {text}")
 
         state["query_count"] = state.get("query_count", 0) + 1
         _log_activity(session_id, "search", f"'{query[:40]}' → {len(boosted[:top_k])} results", elapsed_ms)
@@ -1887,6 +1945,7 @@ def unmount(session_id: str = "") -> str:
     state["texts"] = []
     state["binary_corpus"] = None
     state["signatures"] = None
+    state["hippocampus"] = None
     state["modified"] = False
 
     _log_activity(session_id, "unmount", name)
@@ -1913,17 +1972,96 @@ def get_status(session_id: str = "") -> str:
     modified = " (unsaved changes)" if state["modified"] else ""
     active_sessions = len(_sessions)
 
+    hippo = state.get("hippocampus")
+    hippo_str = "No"
+    if hippo:
+        n_linked = sum(1 for h in hippo if h.get("prev") or h.get("next"))
+        hippo_str = f"Yes ({n_linked} linked)"
+
     return (
         f"Cartridge: {cart}{modified} | "
         f"Memories: {n}/{MAX_ENTRIES} | "
         f"Embedding dim: {dim} | "
         f"Hamming index: {'Yes' if has_hamming else 'No'} ({ham_bytes}) | "
+        f"Hippocampus: {hippo_str} | "
         f"GPU: {gpu} | "
         f"Sessions: {active_sessions} | "
         f"Session: {session_id} | "
         f"Search: cosine+hamming 70/30+kw | "
         f"Embed: nomic-embed-text-v1.5 via SentenceTransformer"
     )
+
+
+@mcp.tool()
+def passage_links(idx: int, session_id: str = "") -> str:
+    """Get hippocampus navigation links for a passage by index.
+
+    Returns prev/next pointers, source hash, sequence position, flags,
+    and the text of linked passages for easy traversal.
+
+    Args:
+        idx: Passage index (0-based, from search results)
+        session_id: Session identifier (uses default session if empty)
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"passage_links(idx={idx}, session={session_id})")
+
+    if state["cartridge_name"] is None:
+        return "No cartridge mounted."
+
+    hippo = state.get("hippocampus")
+    if not hippo:
+        return "No hippocampus metadata in this cartridge."
+
+    if idx < 0 or idx >= len(hippo):
+        return f"Index {idx} out of range (0-{len(hippo)-1})."
+
+    meta = hippo[idx]
+    texts = state["texts"]
+
+    lines = [f"Passage #{idx} metadata:"]
+    lines.append(f"  pattern_id:  {meta['pattern_id']}")
+    lines.append(f"  seq:         {meta['sequence_num']}")
+    lines.append(f"  source_hash: {meta['source_hash']:08x}")
+    lines.append(f"  timestamp:   {meta['timestamp']}")
+
+    flags = []
+    if meta["flags"] & 0x01: flags.append("TOMBSTONE")
+    if meta["flags"] & 0x02: flags.append("PINNED")
+    if meta["flags"] & 0x04: flags.append("HAS_PARENT")
+    if meta["flags"] & 0x08: flags.append("HAS_CHILD")
+    if meta["flags"] & 0x10: flags.append("HAS_SIBLING")
+    lines.append(f"  flags:       {', '.join(flags) if flags else 'none'}")
+
+    # Prev/Next navigation with text previews
+    if meta["prev"] is not None:
+        pi = meta["prev"] - 1  # pattern_id is 1-based, texts are 0-based
+        if 0 <= pi < len(texts):
+            preview = texts[pi][:120].replace("\n", " ")
+            lines.append(f"  PREV (#{pi}): {preview}...")
+        else:
+            lines.append(f"  PREV: pattern {meta['prev']} (out of range)")
+    else:
+        lines.append(f"  PREV: none (start of document)")
+
+    if meta["next"] is not None:
+        ni = meta["next"] - 1
+        if 0 <= ni < len(texts):
+            preview = texts[ni][:120].replace("\n", " ")
+            lines.append(f"  NEXT (#{ni}): {preview}...")
+        else:
+            lines.append(f"  NEXT: pattern {meta['next']} (out of range)")
+    else:
+        lines.append(f"  NEXT: none (end of document)")
+
+    if meta["sibling"] is not None:
+        si = meta["sibling"] - 1
+        if 0 <= si < len(texts):
+            preview = texts[si][:120].replace("\n", " ")
+            lines.append(f"  SIBLING (#{si}): {preview}...")
+
+    return "\n".join(lines)
 
 
 # ============================================================
