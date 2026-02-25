@@ -2155,6 +2155,50 @@ def passage_links(idx: int, session_id: str = "") -> str:
     return "\n".join(lines)
 
 
+@mcp.tool()
+def get_passage(idx: int, session_id: str = "") -> str:
+    """Retrieve a passage by index with full text and navigation links.
+
+    Use this after memory_search to navigate to prev/next passages
+    within the same document. Search results include [prev=#N next=#N]
+    hints — pass those indices here to read adjacent passages.
+
+    Args:
+        idx: Passage index (0-based, from search results or prev/next hints)
+        session_id: Session identifier (uses default session if empty)
+    """
+    session_id = _resolve_session_id(session_id)
+    state = _get_session(session_id)
+    log.info(f"get_passage(idx={idx}, session={session_id})")
+
+    if state["cartridge_name"] is None:
+        return "No cartridge mounted."
+
+    texts = state["texts"]
+    if idx < 0 or idx >= len(texts):
+        return f"Index {idx} out of range (0-{len(texts)-1})."
+
+    full_text = texts[idx]
+
+    # Navigation from hippocampus
+    nav_parts = []
+    hippo = state.get("hippocampus")
+    if hippo and idx < len(hippo):
+        meta = hippo[idx]
+        if meta["prev"] is not None:
+            pi = meta["prev"] - 1
+            nav_parts.append(f"prev=#{pi}")
+        if meta["next"] is not None:
+            ni = meta["next"] - 1
+            nav_parts.append(f"next=#{ni}")
+
+    nav = f" [{' '.join(nav_parts)}]" if nav_parts else ""
+    header = f"Passage #{idx}{nav} from '{state['cartridge_name']}':\n\n"
+
+    _log_activity(session_id, "get_passage", f"idx={idx}", 0)
+    return header + full_text
+
+
 # ============================================================
 # HTTP MIDDLEWARE (auth + rate limiting)
 # ============================================================

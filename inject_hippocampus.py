@@ -46,6 +46,8 @@ def extract_source(text: str) -> str:
 
     # No tag — use first line as source
     first_line = text.split('\n')[0][:80].strip()
+    # Strip "(part N/M)" suffix so all chunks of the same file group together
+    first_line = re.sub(r'\s*\(part\s+\d+/\d+\)\s*$', '', first_line)
     return first_line or "unknown"
 
 
@@ -62,8 +64,8 @@ def main():
     print(f"Keys: {keys}")
 
     if "hippocampus" in data:
-        print("Cart already has hippocampus! Nothing to do.")
-        return
+        print("Cart already has hippocampus — will overwrite.")
+
 
     # Get texts
     if "compressed_texts" in data:
