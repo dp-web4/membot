@@ -2281,18 +2281,22 @@ if __name__ == "__main__":
                         help="HTTP bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8000,
                         help="HTTP port (default: 8000)")
-    parser.add_argument("--read-only", action="store_true",
-                        help="Disable memory_store and save_cartridge (public server mode)")
+    parser.add_argument("--read-only", action="store_true", default=True,
+                        help="Disable memory_store and save_cartridge (default: on)")
+    parser.add_argument("--writable", action="store_true",
+                        help="Enable memory_store and save_cartridge (override read-only)")
     parser.add_argument("--mount", type=str, default=None,
                         help="Auto-mount a cartridge on startup (creates empty cart if not found)")
     args = parser.parse_args()
 
-    _server_config["read_only"] = args.read_only
+    _server_config["read_only"] = not args.writable
 
     log.info("Starting Membot — Brain Cartridge Server...")
     log.info(f"Transport: {args.transport}")
-    if args.read_only:
-        log.info("READ-ONLY mode: memory_store and save_cartridge disabled")
+    if _server_config["read_only"]:
+        log.info("READ-ONLY mode (default): memory_store and save_cartridge disabled. Use --writable to enable.")
+    else:
+        log.info("WRITABLE mode: memory_store and save_cartridge enabled")
     log.info(f"Cartridge dirs: {CARTRIDGE_DIRS}")
     log.info(f"Security: max_entries={MAX_ENTRIES}, max_text={MAX_TEXT_LENGTH}, pkl=trusted-dirs-only")
 
@@ -2346,7 +2350,7 @@ if __name__ == "__main__":
         api_key = os.environ.get("MEMBOT_API_KEY")
         _setup_http_middleware(api_key)
         log.info(f"HTTP server starting on {args.host}:{args.port}")
-        if args.read_only:
+        if _server_config["read_only"]:
             log.info("Public server mode: write operations blocked")
 
     mcp.run(transport=args.transport, host=args.host, port=args.port)

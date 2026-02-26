@@ -53,13 +53,14 @@ pip install -r requirements.txt
 
 ```bash
 # Local (stdio)--for OpenClaw, Claude Desktop, local agents
+# Starts read-only by default. Add --writable to enable store and save.
 python membot_server.py
 
-# Remote (HTTP)--for any MCP client over the network
+# Remote (HTTP)--for any MCP client over the network (read-only by default)
 python membot_server.py --transport http --port 8000
 
-# Read-only (disables store and save)--for public-facing servers
-python membot_server.py --transport http --port 8000 --read-only
+# Writable mode--for personal or team servers that need store and save
+python membot_server.py --transport http --port 8000 --writable
 ```
 
 | Flag | Default | Description |
@@ -67,7 +68,7 @@ python membot_server.py --transport http --port 8000 --read-only
 | `--transport` | `stdio` | Transport mode: `stdio`, `http`, or `sse` |
 | `--host` | `0.0.0.0` | Bind address (HTTP/SSE mode) |
 | `--port` | `8000` | Listen port (HTTP/SSE mode) |
-| `--read-only` | off | Disable `memory_store` and `save_cartridge` |
+| `--writable` | off | Enable `memory_store` and `save_cartridge` (read-only by default) |
 
 **stdio mode**: JSON-RPC over stdin/stdout, designed for MCP agent frameworks that launch Membot as a subprocess.
 
@@ -237,7 +238,7 @@ Then access at `https://your-domain/membot/depot`.
 
 ### The Neuromorphic Substrate
 
-Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 million neurons) with Hebbian weights, Mexican hat inhibition, and energy dynamics. The lattice provides **content-addressable recall**: present a partial or noisy cue, and the attractor dynamics converge to the correct stored pattern. This is Hopfield network behavior, validated to 1 million patterns with no capacity wall.
+Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 million neurons) with Hebbian weights, Mexican hat inhibition, and energy dynamics. The lattice provides **content-addressable recall**: present a partial or noisy cue, and the attractor dynamics converge to the correct stored pattern. This is Hopfield network behavior, validated at 1 million Wikipedia embeddings with R@1=1.000 under clean, erasure, and bitflip conditions--no capacity wall found.
 
 Search uses the compact binary index (fast, no GPU). Recall uses the full lattice physics (noise-tolerant, associative). One substrate, two access modes.
 
@@ -305,8 +306,8 @@ export MEMBOT_API_KEY="my-secret-key-here"
 # 2. Start the server
 python membot_server.py --transport http --port 8000
 
-# Or read-only (public-facing, disables store and save)
-python membot_server.py --transport http --port 8000 --read-only
+# Or writable (enables store and save -- read-only by default)
+python membot_server.py --transport http --port 8000 --writable
 ```
 
 Clients connect by passing `Authorization: Bearer my-secret-key-here` in their HTTP headers. That's it — no account system, no registration. One key per server instance.
@@ -337,16 +338,16 @@ claude mcp add --transport http --scope user membot http://your-server:8000/mcp 
 
 ### Deployment Architectures
 
-**Public dispensary** (read-only): Multiple agents search shared cartridges. Nobody can write. Build cartridges locally, upload to server.
+**Public dispensary** (read-only, default): Multiple agents search shared cartridges. Nobody can write. Build cartridges locally, upload to server. This is the default mode--no extra flags needed.
 
 ```bash
-MEMBOT_API_KEY="shared-read-key" python membot_server.py --transport http --read-only
+MEMBOT_API_KEY="shared-read-key" python membot_server.py --transport http
 ```
 
 **Team server** (read-write): Multiple agents mount, search, and store independently. Each agent uses a `session_id` to get its own isolated state.
 
 ```bash
-MEMBOT_API_KEY="team-key" python membot_server.py --transport http
+MEMBOT_API_KEY="team-key" python membot_server.py --transport http --writable
 ```
 
 **Personal server** (full access): One user, one key, full CRUD. Add to your system startup for always-on memory.
@@ -382,7 +383,8 @@ sudo systemctl start membot
 - **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
 - **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
 - **Resource limits**: Max 100,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
-- **Concurrent writes**: Multiple sessions can mount and search simultaneously, but concurrent saves to the same cartridge file are last-writer-wins. Use `--read-only` for public servers. If you need file locking, per-user API keys, or a managed team deployment, [get in touch](mailto:andy@project-you.app).
+- **Read-only by default**: The server starts in read-only mode. `memory_store` and `save_cartridge` are disabled unless you explicitly pass `--writable`. This makes public-facing deployments safe by default.
+- **Concurrent writes**: In writable mode, multiple sessions can mount and search simultaneously, but concurrent saves to the same cartridge file are last-writer-wins. If you need file locking, per-user API keys, or a managed team deployment, [get in touch](mailto:andy@project-you.app).
 
 ## Embedding Model
 
