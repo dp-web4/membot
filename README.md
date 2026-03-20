@@ -30,6 +30,19 @@ The binary code is computed at mount time: `bit_i = 1 if embedding_i > 0`. This 
 | Hamming (sign-zero binary) | Population code agreement | 96 MB |
 | Keywords (raw text) | Exact term matches | (in passage text) |
 
+### Hamming-Only Mode
+
+Cartridges can ship with **only sign bits and text**--no full embeddings required. Membot auto-detects what's available and uses the best search mode:
+
+| Cart Contents | Search Mode | Storage at 2.4M |
+|---------------|-------------|------------------|
+| Embeddings + sign bits | 70% cosine + 30% Hamming + keywords | ~7.2 GB |
+| Sign bits only | Hamming + keywords | ~220 MB |
+
+Hamming-only carts achieve R@1=1.000 on 25K patterns and return high-quality results at 2.4 million scale. This makes it practical to serve massive knowledge bases from small servers--2.4 million arXiv paper abstracts search from a 3 GB cart with zero float operations.
+
+To build a Hamming-only cart, embed your passages, compute sign bits with `np.packbits((embeddings > 0).astype(np.uint8), axis=1)`, and store them in the `sign_bits` field of the cart. See `strip_embeddings.py` for an example that converts an existing cart.
+
 ## Quick Start
 
 ### Prerequisites
@@ -382,7 +395,7 @@ sudo systemctl start membot
 - **PKL sandboxing**: Legacy `.pkl` files are only loaded from trusted directories (configurable)
 - **Integrity verification**: SHA256 manifest checked on mount; tampered cartridges are rejected
 - **Input sanitization**: Cartridge names validated against path traversal; text and query lengths capped
-- **Resource limits**: Max 100,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
+- **Resource limits**: Max 3,000,000 entries per cartridge, 10,000 chars per store, 2,000 chars per query
 - **Read-only by default**: The server starts in read-only mode. `memory_store` and `save_cartridge` are disabled unless you explicitly pass `--writable`. This makes public-facing deployments safe by default.
 - **Concurrent writes**: In writable mode, multiple sessions can mount and search simultaneously, but concurrent saves to the same cartridge file are last-writer-wins. If you need file locking, per-user API keys, or a managed team deployment, [get in touch](mailto:andy@project-you.app).
 

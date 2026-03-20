@@ -81,11 +81,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "cartridges"),
     os.path.join(BASE_DIR, "data"),
+    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "webgpu", "cartridges"),
+    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "cartridges"),
 ]
 HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces physics L2)
 
 # --- Security Limits ---
-MAX_ENTRIES = 100_000        # Max memories per cartridge
+MAX_ENTRIES = 3_000_000      # Max memories per cartridge (supports 2.4M arXiv)
 MAX_TEXT_LENGTH = 10_000     # Max characters per memory_store call
 MAX_QUERY_LENGTH = 2_000    # Max characters per search query
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
@@ -398,12 +400,20 @@ def load_pkl_cartridge(path: str) -> dict:
     elif isinstance(embeddings, np.ndarray) and embeddings.dtype != np.float32:
         embeddings = embeddings.astype(np.float32)
 
-    return {
+    result = {
         "embeddings": embeddings,
         "texts": list(passages),
         "version": version,
         "format": "pkl",
     }
+    # Pre-computed sign bits (packed uint8, 96 bytes per pattern)
+    if "sign_bits" in data:
+        result["sign_bits"] = data["sign_bits"]
+    # Extra metadata fields
+    for key in ("paper_ids", "titles", "metadata"):
+        if key in data:
+            result[key] = data[key]
+    return result
 
 
 def load_npz_cartridge(path: str) -> dict:
@@ -550,6 +560,21 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 
+def _log_rest(request: Request, endpoint: str, extra: str = ""):
+    """Log REST API access with client identification."""
+    client = request.headers.get("x-client", "unknown")
+    ua = request.headers.get("user-agent", "")
+    ip = request.client.host if request.client else "?"
+    sid = "(no body)"
+    msg = f"[REST] {endpoint} | client={client} | ip={ip}"
+    if extra:
+        msg += f" | {extra}"
+    if ua and client == "unknown":
+        # Show UA only if no explicit client header (helps identify curl vs browser vs extension)
+        msg += f" | ua={ua[:80]}"
+    log.info(msg)
+
+
 @mcp.custom_route("/api/store", methods=["POST", "OPTIONS"])
 async def rest_store(request: Request) -> JSONResponse:
     """REST wrapper for memory_store — used by Heartbeat browser extension."""
@@ -557,9 +582,12 @@ async def rest_store(request: Request) -> JSONResponse:
         return JSONResponse({}, headers=_cors_headers())
     try:
         data = await request.json()
+        content = data.get("content", "")
+        tags = data.get("tags", "")
+        _log_rest(request, "STORE", f"tags={tags} len={len(content)}")
         result = memory_store.fn(
-            content=data.get("content", ""),
-            tags=data.get("tags", ""),
+            content=content,
+            tags=tags,
             session_id=data.get("session_id", "")
         )
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
@@ -577,12 +605,16 @@ async def rest_search(request: Request) -> JSONResponse:
         data = await request.json()
         query = data.get("query", "")
         top_k = data.get("top_k", 5)
+        _log_rest(request, "SEARCH", f"q=\"{query[:60]}\" top_k={top_k}")
         session_id = _resolve_session_id(data.get("session_id", ""))
         state = _get_session(session_id)
 
         if state["cartridge_name"] is None:
             return JSONResponse({"status": "ok", "results": [], "error": "No cartridge mounted"}, headers=_cors_headers())
-        if state["embeddings"] is None or len(state["embeddings"]) == 0:
+
+        has_emb = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
+        has_ham = state["binary_corpus"] is not None
+        if not has_emb and not has_ham:
             return JSONResponse({"status": "ok", "results": []}, headers=_cors_headers())
 
         t0 = time.time()
@@ -590,27 +622,41 @@ async def rest_search(request: Request) -> JSONResponse:
         # Embed query
         query_emb = embed_text(query, prefix="search_query")
 
-        # Cosine similarity
-        stored = state["embeddings"]
-        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
-        query_norm = np.linalg.norm(query_emb) + 1e-9
-        emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
+        # Helper: Hamming scores (handles packed and unpacked)
+        def _ham_scores(q_emb, corpus_bin):
+            is_packed = corpus_bin.shape[1] <= 96
+            if is_packed:
+                q_packed = np.packbits((q_emb > 0).astype(np.uint8))
+                xor = np.bitwise_xor(q_packed, corpus_bin)
+                dist = np.unpackbits(xor, axis=1).sum(axis=1)
+                return 1.0 - dist.astype(np.float32) / 768
+            else:
+                q_bin = (q_emb > 0).astype(np.uint8)
+                xor = np.bitwise_xor(q_bin, corpus_bin)
+                return 1.0 - xor.sum(axis=1).astype(np.float32) / corpus_bin.shape[1]
 
-        # Hamming blend
-        scores = emb_scores
-        if HAMMING_BLEND > 0 and state["binary_corpus"] is not None:
-            try:
-                q_bin = (query_emb > 0).astype(np.uint8)
-                corpus_bin = state["binary_corpus"]
-                n_bin = min(len(corpus_bin), len(emb_scores))
-                n_bits = corpus_bin.shape[1]
-                xor = np.bitwise_xor(q_bin, corpus_bin[:n_bin])
-                ham_scores = 1.0 - xor.sum(axis=1).astype(np.float32) / n_bits
-                blended = np.copy(emb_scores)
-                blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham_scores
-                scores = blended
-            except Exception:
-                pass
+        if has_emb:
+            # Cosine similarity
+            stored = state["embeddings"]
+            stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
+            query_norm = np.linalg.norm(query_emb) + 1e-9
+            emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
+
+            # Hamming blend
+            scores = emb_scores
+            if HAMMING_BLEND > 0 and has_ham:
+                try:
+                    corpus_bin = state["binary_corpus"]
+                    n_bin = min(len(corpus_bin), len(emb_scores))
+                    ham = _ham_scores(query_emb, corpus_bin[:n_bin])
+                    blended = np.copy(emb_scores)
+                    blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham
+                    scores = blended
+                except Exception:
+                    pass
+        else:
+            # Hamming-only
+            scores = _ham_scores(query_emb, state["binary_corpus"])
 
         # Keyword reranking
         STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
@@ -680,21 +726,70 @@ async def rest_status(request: Request) -> JSONResponse:
     """REST health check — returns structured cartridge status."""
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
+    _log_rest(request, "STATUS")
     try:
         sid = request.query_params.get("session_id", "")
         sid = _resolve_session_id(sid)
         state = _get_session(sid)
         n = len(state["texts"]) if state["texts"] else 0
+        import socket
         return JSONResponse({
             "status": "ok",
             "cartridge": state["cartridge_name"],
             "memories": n,
             "gpu": _gpu_state["available"],
             "hamming": state["binary_corpus"] is not None,
+            "search_mode": "hamming+embedding" if (state.get("has_embeddings") and state["binary_corpus"] is not None) else "hamming-only" if state["binary_corpus"] is not None else "embedding" if state.get("has_embeddings") else "none",
             "session_id": sid,
             "read_only": _server_config.get("read_only", False),
+            "hostname": socket.gethostname(),
         }, headers=_cors_headers())
     except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/sync", methods=["POST", "OPTIONS"])
+async def rest_sync(request: Request) -> JSONResponse:
+    """Heartbeat JSONL sync — append harvested exchanges to a local flat file.
+
+    POST body: { "exchanges": [...], "machine": "hostname" }
+    Each exchange: { turn, userMessage, assistantMessage, timestamp, url, platform, platformName }
+    Appends to cartridges/heartbeat_<machine>.jsonl (one JSON object per line).
+    """
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        exchanges = data.get("exchanges", [])
+        machine = re.sub(r'[^a-zA-Z0-9_\-]', '_', data.get("machine", "unknown"))
+
+        if not exchanges:
+            return JSONResponse({"status": "ok", "appended": 0}, headers=_cors_headers())
+
+        # Ensure cartridges directory exists
+        cart_dir = os.path.join(BASE_DIR, "cartridges")
+        os.makedirs(cart_dir, exist_ok=True)
+
+        sync_file = os.path.join(cart_dir, f"heartbeat_{machine}.jsonl")
+        appended = 0
+
+        with open(sync_file, "a", encoding="utf-8") as f:
+            for ex in exchanges:
+                line = json.dumps(ex, ensure_ascii=False)
+                f.write(line + "\n")
+                appended += 1
+
+        file_size = os.path.getsize(sync_file)
+        _log_rest(request, "SYNC", f"machine={machine} appended={appended} file_size={file_size}")
+
+        return JSONResponse({
+            "status": "ok",
+            "appended": appended,
+            "file": f"heartbeat_{machine}.jsonl",
+            "file_size": file_size,
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/sync error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
@@ -765,6 +860,37 @@ async def rest_passage(request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok", "passage": entry}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/passage error: {e}")
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+
+
+@mcp.custom_route("/api/embed", methods=["POST", "OPTIONS"])
+async def rest_embed(request: Request) -> JSONResponse:
+    """Local embedding via sentence-transformers — replaces Nomic API calls from browser extension."""
+    if request.method == "OPTIONS":
+        return JSONResponse({}, headers=_cors_headers())
+    try:
+        data = await request.json()
+        texts = data.get("texts", [])
+        task_type = data.get("task_type", "search_document")
+        if not texts:
+            return JSONResponse({"status": "error", "error": "No texts provided"}, status_code=400, headers=_cors_headers())
+
+        # Map Nomic task_type to sentence-transformers prefix
+        prefix = "search_query" if task_type == "search_query" else "search_document"
+
+        embeddings = []
+        for text in texts:
+            vec = embed_text(text, prefix=prefix)
+            embeddings.append(vec.tolist())
+
+        _log_rest(request, "EMBED", f"n={len(texts)} task={task_type}")
+        return JSONResponse({
+            "status": "ok",
+            "embeddings": embeddings,
+            "model": "nomic-ai/nomic-embed-text-v1.5"
+        }, headers=_cors_headers())
+    except Exception as e:
+        log.error(f"REST /api/embed error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
 
 
@@ -1684,11 +1810,18 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         state["hippocampus"] = data.get("hippocampus")
         state["modified"] = False
 
-        # Compute sign_zero binary corpus for Hamming search (96 bytes per pattern)
-        if len(embeddings) > 0:
+        # Sign-zero binary corpus for Hamming search
+        # Priority: pre-computed sign_bits > computed from embeddings > None
+        if "sign_bits" in data and data["sign_bits"] is not None:
+            state["binary_corpus"] = data["sign_bits"]
+            log.info(f"Loaded pre-computed sign bits: {data['sign_bits'].shape}")
+        elif len(embeddings) > 0:
             state["binary_corpus"] = (embeddings > 0).astype(np.uint8)
         else:
             state["binary_corpus"] = None
+
+        # Track whether we have full embeddings (for search mode selection)
+        state["has_embeddings"] = len(embeddings) > 0 and embeddings.size > 0
 
         n = len(texts)
         dim = embeddings.shape[1] if len(embeddings) > 0 else 0
@@ -1760,8 +1893,11 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
 
-    if state["embeddings"] is None or len(state["embeddings"]) == 0:
-        return "Cartridge is empty."
+    has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
+    has_hamming = state["binary_corpus"] is not None
+
+    if not has_embeddings and not has_hamming:
+        return "Cartridge is empty (no embeddings or sign bits)."
 
     try:
         t0 = time.time()
@@ -1769,42 +1905,59 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         # 1. Embed query
         query_emb = embed_text(query, prefix="search_query")
 
-        # 2. Embedding cosine similarity
-        stored = state["embeddings"]
-        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
-        query_norm = np.linalg.norm(query_emb) + 1e-9
-        emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
-
-        # 3. Sign-zero Hamming search: binary XOR distance as secondary signal
-        search_mode = "embedding"
-        ham_scores = None
-
-        if HAMMING_BLEND > 0 and state["binary_corpus"] is not None:
-            try:
-                # Sign-zero encode query: bit_i = 1 if query_emb_i > 0
+        # Helper: compute Hamming scores against binary corpus
+        # Handles both packed (N, 96) and unpacked (N, 768) formats
+        def hamming_scores(query_emb, corpus_bin):
+            is_packed = corpus_bin.shape[1] <= 96
+            if is_packed:
+                q_packed = np.packbits((query_emb > 0).astype(np.uint8))
+                xor = np.bitwise_xor(q_packed, corpus_bin)
+                # Popcount via unpackbits
+                dist = np.unpackbits(xor, axis=1).sum(axis=1)
+                n_bits = 768
+            else:
                 q_bin = (query_emb > 0).astype(np.uint8)
-                corpus_bin = state["binary_corpus"]
-                n_bin = min(len(corpus_bin), len(emb_scores))
-
-                # Hamming similarity: 1 - (XOR distance / n_bits)
-                n_bits = corpus_bin.shape[1]
-                xor = np.bitwise_xor(q_bin, corpus_bin[:n_bin])
+                xor = np.bitwise_xor(q_bin, corpus_bin)
                 dist = xor.sum(axis=1)
-                ham_scores = 1.0 - dist.astype(np.float32) / n_bits
+                n_bits = corpus_bin.shape[1]
+            return 1.0 - dist.astype(np.float32) / n_bits
 
-                # Blend: 70% embedding cosine + 30% Hamming
-                blended = np.copy(emb_scores)
-                blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham_scores
-                scores = blended
-                search_mode = "hamming+embedding"
-                log.info(f"Hamming search: sign_zero blended {1.0 - HAMMING_BLEND:.0%}/{HAMMING_BLEND:.0%}, {n_bin} patterns")
-            except Exception as e:
-                log.warning(f"Hamming search failed, falling back to embedding: {e}")
+        if has_embeddings:
+            # 2a. Embedding cosine similarity
+            stored = state["embeddings"]
+            stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
+            query_norm = np.linalg.norm(query_emb) + 1e-9
+            emb_scores = np.dot(stored / stored_norms, query_emb / query_norm)
+
+            # 3a. Blend with Hamming if available
+            search_mode = "embedding"
+            ham_scores = None
+
+            if HAMMING_BLEND > 0 and has_hamming:
+                try:
+                    corpus_bin = state["binary_corpus"]
+                    n_bin = min(len(corpus_bin), len(emb_scores))
+                    ham = hamming_scores(query_emb, corpus_bin[:n_bin])
+
+                    blended = np.copy(emb_scores)
+                    blended[:n_bin] = (1.0 - HAMMING_BLEND) * emb_scores[:n_bin] + HAMMING_BLEND * ham
+                    scores = blended
+                    search_mode = "hamming+embedding"
+                    log.info(f"Hamming search: sign_zero blended {1.0 - HAMMING_BLEND:.0%}/{HAMMING_BLEND:.0%}, {n_bin} patterns")
+                except Exception as e:
+                    log.warning(f"Hamming search failed, falling back to embedding: {e}")
+                    scores = emb_scores
+            else:
                 scores = emb_scores
+                if not has_hamming:
+                    log.info("No binary corpus — embedding-only search")
+
         else:
-            scores = emb_scores
-            if state["binary_corpus"] is None:
-                log.info("No binary corpus — embedding-only search")
+            # 2b. HAMMING-ONLY search (no full embeddings in cart)
+            search_mode = "hamming-only"
+            corpus_bin = state["binary_corpus"]
+            scores = hamming_scores(query_emb, corpus_bin)
+            log.info(f"Hamming-only search: {len(corpus_bin)} patterns, packed={corpus_bin.shape[1] <= 96}")
 
         # 4. Keyword reranking — pull wider candidate pool, boost by keyword hits
         STOP_WORDS = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
