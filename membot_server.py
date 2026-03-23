@@ -49,6 +49,7 @@ import re
 import struct
 import hashlib
 import pickle
+import sqlite3
 import zlib
 import time
 import base64
@@ -83,6 +84,7 @@ CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "data"),
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "webgpu", "cartridges"),
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "cartridges"),
+    os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "self_contained_cart_test"),
 ]
 HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces physics L2)
 
@@ -192,7 +194,22 @@ def _new_session() -> dict:
         "mount_count": 0,
         "last_action": None,      # e.g. "search 'earthquake'" or "mount wiki-10k"
         "last_action_time": None,
+        "sqlite_conn": None,      # sqlite3.Connection for split carts (text on disk)
+        "is_split_cart": False,   # True if using index + SQLite sidecar
+        "has_embeddings": False,
     }
+
+
+def _sqlite_fetch_passages(conn: sqlite3.Connection, indices: list) -> dict:
+    """Fetch full passages from SQLite sidecar by index. Returns {idx: passage}."""
+    if not conn or not indices:
+        return {}
+    placeholders = ",".join("?" for _ in indices)
+    rows = conn.execute(
+        f"SELECT idx, passage, title, paper_id FROM passages WHERE idx IN ({placeholders})",
+        indices
+    ).fetchall()
+    return {r[0]: {"passage": r[1], "title": r[2], "paper_id": r[3]} for r in rows}
 
 
 # --- Depot Activity Log (ring buffer) ---
@@ -417,12 +434,50 @@ def load_pkl_cartridge(path: str) -> dict:
 
 
 def load_npz_cartridge(path: str) -> dict:
-    """Load an .npz cartridge (safe — no code execution)."""
+    """Load an .npz cartridge (safe — no code execution).
+
+    Supports split carts: if the index contains has_sqlite=True,
+    texts are loaded as snippets from the index and full passages
+    are fetched on demand from a SQLite sidecar file.
+    """
     data = np.load(path, allow_pickle=True)
 
     result = {"format": "npz", "version": "unknown"}
 
-    # Handle various NPZ layouts
+    # Check for split cart (index + SQLite sidecar)
+    has_sqlite = bool(data["has_sqlite"]) if "has_sqlite" in data else False
+    if has_sqlite:
+        db_name = str(data["text_db"]) if "text_db" in data else None
+        if db_name:
+            db_path = os.path.join(os.path.dirname(path), db_name)
+            if os.path.exists(db_path):
+                result["sqlite_db_path"] = db_path
+                log.info(f"Split cart: SQLite sidecar at {db_path}")
+            else:
+                log.warning(f"Split cart: SQLite sidecar not found at {db_path}")
+
+        # Snippets serve as texts for keyword reranking
+        if "snippets" in data:
+            snippets = data["snippets"]
+            if isinstance(snippets, np.ndarray) and snippets.dtype == object:
+                result["texts"] = list(snippets)
+            else:
+                result["texts"] = list(snippets)
+            count = int(data["count"]) if "count" in data else len(result["texts"])
+            log.info(f"Split cart: {count:,} snippets loaded, full text in SQLite")
+        else:
+            result["texts"] = []
+
+        result["embeddings"] = np.array([])
+        result["is_split_cart"] = True
+
+        # Sign bits
+        if "sign_bits" in data:
+            result["sign_bits"] = data["sign_bits"]
+
+        return result
+
+    # Handle various NPZ layouts (standard carts)
     if "embeddings" in data:
         result["embeddings"] = data["embeddings"]
     elif "embs" in data:
@@ -1823,11 +1878,25 @@ def mount_cartridge(name: str, session_id: str = "") -> str:
         # Track whether we have full embeddings (for search mode selection)
         state["has_embeddings"] = len(embeddings) > 0 and embeddings.size > 0
 
+        # Split cart: open SQLite sidecar for on-demand text retrieval
+        if data.get("sqlite_db_path"):
+            # Close any previous connection
+            if state.get("sqlite_conn"):
+                try: state["sqlite_conn"].close()
+                except: pass
+            state["sqlite_conn"] = sqlite3.connect(data["sqlite_db_path"])
+            state["is_split_cart"] = True
+            log.info(f"Split cart: SQLite connection opened to {data['sqlite_db_path']}")
+        else:
+            state["sqlite_conn"] = None
+            state["is_split_cart"] = data.get("is_split_cart", False)
+
         n = len(texts)
         dim = embeddings.shape[1] if len(embeddings) > 0 else 0
         elapsed_ms = (time.time() - t0) * 1000
 
-        log.info(f"Loaded {n} entries, dim={dim}, format={data['format']}, integrity={verify_msg}, sign_zero={n} codes, in {elapsed_ms:.0f}ms")
+        split_label = " (split: snippets in RAM, full text in SQLite)" if state["is_split_cart"] else ""
+        log.info(f"Loaded {n} entries, dim={dim}, format={data['format']}, integrity={verify_msg}, sign_zero={n} codes, in {elapsed_ms:.0f}ms{split_label}")
 
         # Load L2 signatures if available
         sig_base = cart["path"].rsplit(".", 1)[0]
@@ -1984,12 +2053,22 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
         elapsed_ms = (time.time() - t0) * 1000
 
         # 5. Format results (include passage index + nav hints if hippocampus present)
+        # For split carts, fetch full passages from SQLite for display
+        top_indices = [i for i, _, _ in boosted[:top_k]]
+        full_texts = {}
+        if state.get("is_split_cart") and state.get("sqlite_conn"):
+            full_texts = _sqlite_fetch_passages(state["sqlite_conn"], top_indices)
+
         hippo = state.get("hippocampus")
         results = []
         for rank, (i, final_score, kw_boost) in enumerate(boosted[:top_k], 1):
             if final_score < 0.1:
                 continue
-            text = state["texts"][i]
+            # Use full text from SQLite if available, otherwise snippet from RAM
+            if i in full_texts:
+                text = full_texts[i]["passage"]
+            else:
+                text = state["texts"][i]
             if len(text) > 500:
                 text = text[:500] + "..."
 
@@ -2018,10 +2097,13 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
             return f"No relevant matches for '{query}' (searched {len(state['texts'])} memories, {elapsed_ms:.0f}ms)"
 
         kw_label = f"+kw" if keywords else ""
+        split_label = "+sqlite" if state.get("is_split_cart") else ""
         if search_mode == "hamming+embedding":
-            mode_label = f"hamming+embedding 70/30{kw_label}"
+            mode_label = f"hamming+embedding 70/30{kw_label}{split_label}"
+        elif search_mode == "hamming-only":
+            mode_label = f"hamming-only{kw_label}{split_label}"
         else:
-            mode_label = f"embedding-only{kw_label}"
+            mode_label = f"embedding-only{kw_label}{split_label}"
         header = f"Search [{mode_label}]: {len(results)} results from '{state['cartridge_name']}' ({elapsed_ms:.0f}ms)\n"
         return header + "\n\n".join(results)
 
@@ -2182,6 +2264,11 @@ def unmount(session_id: str = "") -> str:
     if state["modified"]:
         warning = " WARNING: Unsaved changes were discarded."
 
+    # Close SQLite sidecar if open
+    if state.get("sqlite_conn"):
+        try: state["sqlite_conn"].close()
+        except: pass
+
     # Reset session state but keep it alive
     state["cartridge_name"] = None
     state["cartridge_path"] = None
@@ -2191,6 +2278,8 @@ def unmount(session_id: str = "") -> str:
     state["signatures"] = None
     state["hippocampus"] = None
     state["modified"] = False
+    state["sqlite_conn"] = None
+    state["is_split_cart"] = False
 
     _log_activity(session_id, "unmount", name)
     return f"Unmounted '{name}'.{warning}"

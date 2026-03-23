@@ -43,6 +43,40 @@ Hamming-only carts achieve R@1=1.000 on 25K patterns and return high-quality res
 
 To build a Hamming-only cart, embed your passages, compute sign bits with `np.packbits((embeddings > 0).astype(np.uint8), axis=1)`, and store them in the `sign_bits` field of the cart. See `strip_embeddings.py` for an example that converts an existing cart.
 
+### Split Cart Format (Index + SQLite)
+
+For large-scale deployment where RAM is limited, Membot supports **split carts**--a two-file format that keeps the search index in RAM and stores full text on disk:
+
+| File | Format | Contents | Lives in |
+| ---- | ------ | -------- | -------- |
+| `name_index.npz` | NumPy compressed | Sign-zero bits + 200-char snippets + metadata | RAM |
+| `name_text.db` | SQLite | Full passages, titles, external IDs | Disk (paged on demand) |
+
+**How it works:** Hamming search and keyword reranking run entirely in RAM against the compact index. Only the top-K results trigger SQLite lookups (~1ms each) to fetch full passage text for display.
+
+| Format | RAM (2.4M entries) | Disk | Use Case |
+| ------ | ------------------ | ---- | -------- |
+| Standard `.pkl` | ~4 GB | ~3 GB | Local use, full portability |
+| Split `.npz` + `.db` | ~400 MB | ~4 GB | Server deployment, cheap hosting |
+
+Split carts achieve **88% RAM reduction** compared to loading everything into memory. A $12/month server can search 2.4 million entries.
+
+SQLite requires no additional server or daemon--Python's built-in `sqlite3` module reads directly from the `.db` file. Upload two files and you're done.
+
+**Building a split cart:**
+
+```bash
+# Convert any existing .pkl cart to split format
+python build_sqlite_cart.py my_cart.pkl
+
+# Custom output name and snippet length
+python build_sqlite_cart.py my_cart.pkl -o my_split_cart --truncate 300
+```
+
+The builder auto-detects compressed and uncompressed carts. Output: `my_split_cart_index.npz` + `my_split_cart_text.db`.
+
+When mounting, Membot auto-detects the SQLite sidecar and opens it for on-demand text retrieval. Search results show `hamming-only+kw+sqlite` in the mode label.
+
 ## Quick Start
 
 ### Prerequisites
@@ -260,10 +294,13 @@ Search uses the compact binary index (fast, no GPU). Recall uses the full lattic
 A brain cartridge is a self-contained memory unit:
 
 | File | Contents | Required |
-|------|----------|----------|
-| `name.pkl` or `name.cart.npz` | Embeddings + text | Yes |
+| ---- | -------- | -------- |
+| `name.pkl` or `name.cart.npz` | Embeddings + text | Yes (standard cart) |
+| `name_index.npz` + `name_text.db` | Search index + SQLite text | Yes (split cart) |
 | `name_brain.npy` | Hebbian weight matrix (128 MB) | For lattice recall |
 | `name_manifest.json` | SHA256 integrity fingerprint | Recommended |
+
+Standard carts are single-file, fully portable artifacts. Split carts trade portability for dramatically lower RAM usage--ideal for server deployment. See [Split Cart Format](#split-cart-format-index--sqlite) above.
 
 The binary Hamming index is computed automatically at mount time from the stored embeddings--no pre-built index files needed.
 
