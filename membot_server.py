@@ -1976,13 +1976,16 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
 
         # Helper: compute Hamming scores against binary corpus
         # Handles both packed (N, 96) and unpacked (N, 768) formats
+        # Popcount lookup table for packed bytes (avoids unpackbits OOM at scale)
+        _POPCOUNT_TABLE = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+
         def hamming_scores(query_emb, corpus_bin):
             is_packed = corpus_bin.shape[1] <= 96
             if is_packed:
                 q_packed = np.packbits((query_emb > 0).astype(np.uint8))
                 xor = np.bitwise_xor(q_packed, corpus_bin)
-                # Popcount via unpackbits
-                dist = np.unpackbits(xor, axis=1).sum(axis=1)
+                # Popcount via lookup table — O(N*96) uint8, no expansion to 768
+                dist = _POPCOUNT_TABLE[xor].sum(axis=1)
                 n_bits = 768
             else:
                 q_bin = (query_emb > 0).astype(np.uint8)
