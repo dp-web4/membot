@@ -1,5 +1,160 @@
 # Membot Devlog
 
+## 2026-03-24 — Wiki Brain Cart Deployed, Writable Agent Workspace, TUI Session Persistence Gap
+
+### Wiki 2.4M Brain Cart — DEPLOYED TO DROPLET
+- Built split cart from physics-trained wiki brain: `wiki_2400k_brain_index.npz` (380 MB) + `wiki_2400k_brain_text.db` (1.3 GB)
+- Added Wikipedia URLs to SQLite: `https://en.wikipedia.org/wiki/{Title}` auto-generated from first line of each passage
+- Uploaded both files + updated `membot_server.py` to droplet
+- Both arXiv and wiki carts live — **4.8 million entries** on a $12/mo droplet
+- Constraint: only one cart mounted at a time on 2 GB RAM (both indexes = ~760 MB > available)
+
+### Droplet Port Map (finalized)
+| Port | Service | Auth | Status |
+|------|---------|------|--------|
+| 8000 | Membot read-only | None | Running |
+| 8040 | Membot writable | API key | Stopped (needs 4 GB upgrade) |
+| 8100 | Session memory | Bearer token | Running |
+
+The 804x convention: base port + 40 = writable/agent variant. Future: 8140 for session memory agent variant.
+
+### TUI Session Persistence — GAP IDENTIFIED
+OpenClaw TUI stores session transcripts as JSONL at `~/.openclaw/sessions/<session-id>/transcript.jsonl`. Same format family as Claude Code sessions. But no scanner wired up yet — TUI agent research is ephemeral.
+
+**Plan:** Build independent TUI scanner (separate from Claude Code scanner — streams must never cross). Points to own cart `tui_sessions.pkl`. Same embed + append pipeline, different source directory.
+
+### Competitive Analysis: Letta/Claude Subconscious
+- Letta (the MemGPT team) shipping a Claude Code plugin with background agent, 8 structured memory blocks, async transcript processing via lifecycle hooks
+- "Whisper" mode injects suggestions as observations, never blocks Claude
+- No physics, no portable artifacts, Claude Code only
+- Sixth competitor surveyed (Supermemory, virtual-context, claude-mem, Interloom, Letta)
+
+### Interloom — $16.5M Seed for Enterprise Process Mining
+- Munich startup building "Context Graph" from enterprise docs (emails, tickets, transcripts)
+- Captures tacit knowledge (70% of operational decisions never documented)
+- Commerzbank: reduced doc/reality gap from 50% to 5%
+- We *could* do this with our ingestion pipeline + physics association for a fraction of the cost. But enterprise sales is a different game. Filed under "arrows in quiver."
+
+### Neuro-Symbolic Energy Paper — Ammunition for Pitch
+Duggan et al. (arXiv:2602.19260): neuro-symbolic methods outperform VLAs at 100x less energy, 95% vs 34% success, 34 min vs 1.5 day training.
+
+Direct parallel to our architecture:
+- Their PDDL symbolic planning = our attractor dynamics + SimHash structure
+- Their learned diffusion policies = our Hebbian-learned associations
+- Their 80x energy savings = our LLM-free pipeline
+
+**Key quote:** "Explicit symbolic structure improves reliability, data efficiency, and energy consumption."
+
+Our pipeline is LLM-free end to end. Training energy for 2.4M brain cart: ~8.8 MJ estimated (5.75 hrs × 320W GPU). Competitor equivalent would require millions of LLM calls for fact extraction, relationship building, and compaction.
+
+### Auto-Append Status Discrepancy — RESOLVED
+MCP `session_status` reported `Auto-appends: 0` but the actual server console showed active appending:
+```
+[AutoAppend] grew: 2026-02-26 | b6a4d6a9... | +1 passages (was 2490)
+[AutoAppend] Done: +1 passages (111ms embed, 4.9s total). Cartridge now has 15531 passages.
+```
+The counter in the status endpoint may reset on server restart or not track correctly. The pipeline IS working — exchanges flow into the cart via the JSONL scanner. False alarm escalated and corrected.
+
+### Session Startup Protocol — NEW
+Added `feedback_session_startup.md` to memory: at each session start, check the hot stack and read the most recent journal entry. Goal: continuity of *thought*, not just continuity of *facts*. Evolves toward REMINDS_OF triggering journal associations organically.
+
+---
+
+## 2026-03-23 — Split Cart Format, 2.4M ArXiv on Droplet, First Agent Research Session
+
+### Split Cart Format — NEW FEATURE
+Invented a two-file cartridge format to solve the RAM problem for large-scale deployment.
+
+**The problem:** 2.4M passages = ~2.8 GB of Python strings in RAM. A $12/mo droplet (2 GB) can't hold it.
+
+**The solution:** Separate the search index from the text.
+
+| File | Format | Size (2.4M) | Lives in | Purpose |
+|------|--------|-------------|----------|---------|
+| `_index.npz` | NumPy compressed | ~377 MB | RAM | Sign bits + 200-char snippets + metadata |
+| `_text.db` | SQLite | ~1-4 GB | Disk | Full passages, paged on demand per query hit |
+
+Hamming search + keyword reranking run entirely in RAM against the index. Only the top-K display results trigger SQLite lookups (~1ms each). 88% RAM reduction vs loading everything.
+
+SQLite needs no server — Python's built-in `sqlite3` module reads the `.db` file directly.
+
+**Tools built:**
+- `build_sqlite_cart.py` — general-purpose split cart builder (any .pkl → index + SQLite)
+- `compress_cart.py` — general-purpose zlib cart compressor (any .pkl)
+
+### Server Changes
+- `load_npz_cartridge`: detects `has_sqlite=True`, loads snippets, opens SQLite sidecar
+- Mount: opens SQLite connection, stores in session state
+- Search: snippets for keyword reranking (RAM), full text from SQLite (disk) for display only
+- Unmount: closes SQLite connection cleanly
+- Search mode label: `hamming-only+kw+sqlite`
+- Fixed OOM on packed Hamming search: replaced `np.unpackbits` (expanded 2.4M×96 → 2.4M×768 = 1.72 GiB) with byte-level popcount lookup table. O(N×96) instead of O(N×768).
+
+### ArXiv 2.4M Cart — LIVE ON DROPLET
+- `arxiv_2400k_index.npz` (360 MB) + `arxiv_2400k_text.db` (3.5 GB)
+- 2,400,000 arXiv paper abstracts with titles, categories, and arXiv URLs
+- Searchable on the $12/mo droplet with 377 MB RAM usage
+- Search: ~9-18s latency (brute-force Hamming, fixable with FAISS binary index)
+
+### Wiki 2.4M Brain Cart — LIVE ON DROPLET
+- `wiki_2400k_brain_index.npz` (380 MB) + `wiki_2400k_brain_text.db` (1.3 GB)
+- 2,400,000 Wikipedia articles with auto-generated Wikipedia URLs
+- Physics-trained (3 passes V7.5 Hebbian learning) — sign bits encode attractor topology
+- Note: only one cart at a time on 2 GB droplet; both indexes exceed available RAM
+
+### Writable Agent Workspace
+- New systemd service `membot-writable` on port 8040
+- API key protected (`waving-cat-agents-2026`)
+- Shares `cartridges/` with read-only instance — agents can search big carts AND create their own
+- Currently stopped (RAM constraint) — needs 4 GB droplet upgrade
+
+### First Live Agent Research Session — MILESTONE
+OpenClaw TUI (Sonnet) autonomously:
+1. Mounted `arxiv_2400k_index` on the live droplet
+2. Searched "attractor networks" — found Hopfield network papers
+3. Fetched and summarized "Vector Symbolic FSMs in Attractor Neural Networks"
+4. Discovered our sign-zero encoding is **SimHash / Hyperplane LSH** (Charikar 2002) — established prior art
+5. Identified our novelty boundary: SimHash on raw embeddings = known; SimHash on physics-shaped attractor states after Hebbian training = novel
+6. Wrote a full benchmark methodology document (`physics-lsh-benchmark-methodology.md`) with 15+ citations from the arXiv cart
+7. Read and analyzed "The Price Is Not Right" (Duggan et al., arXiv:2602.19260) — neuro-symbolic methods outperform VLAs at 100x less energy
+8. Connected the paper's findings to our architecture
+
+**Key research finding:** Our sign-zero encoding is SimHash (Charikar 2002). Cannot patent the encoding itself. Our novelty is combining it with Hebbian settle dynamics — "SimHash on attractor states" — which nobody else does.
+
+### Competitive Analysis
+
+**Supermemory, virtual-context, claude-mem, Letta/Subconscious** — all surveyed. All require LLM calls for memory operations (fact extraction, relationship building, compaction). We don't.
+
+**The insight:** Our entire memory substrate is LLM-free. Build, store, search, recall — no tokens consumed. The only LLM is the agent on the other end deciding what to search for.
+
+> "The only AI memory system that doesn't need AI to run."
+
+**Comparison at 2.4M scale:**
+
+| | Pinecone | FAISS (IVF+PQ) | Supermemory | Our split cart |
+|---|---|---|---|---|
+| Index size | ~7 GB (cloud) | ~300-600 MB | Cloud | 377 MB |
+| Search latency | ~50ms | ~5-20ms | ~100ms | ~13s (fixable) |
+| LLM in pipeline | No | No | Yes (every op) | No |
+| Association | No | No | No | Yes (physics) |
+| Monthly cost | $70+ | Self-hosted | Usage-based | $12/mo |
+
+### Troubleshooting Docs Added
+- "Session not found" (-32600) error after server restart/crash: documented cause and fix for OpenClaw, Claude Code, Claude Desktop
+- Large cart OOM crash: documented prevention via split carts
+
+### README Updates
+- Split cart format section with tables, build instructions
+- Updated brain cartridge file table to include split format
+- Troubleshooting section
+
+### Three Commits Pushed
+1. `1e4f82b` — Split cart format: SQLite sidecar for low-RAM deployment
+2. `eb89095` — Fix OOM on packed Hamming search: popcount lookup table
+3. `955fac6` — Add troubleshooting section: session errors, OOM on large carts
+
+---
+
 ## 2026-02-08 — Initial Release + OpenClaw Integration
 
 ### What Shipped

@@ -4,7 +4,11 @@
 
 Membot is an MCP server that gives AI agents swappable, searchable memory stored on a neuromorphic substrate. Mount a brain cartridge, search it with multi-signal ranking, store new memories, swap to a different domain--all through standard [Model Context Protocol](https://modelcontextprotocol.io/) tool calls.
 
-Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot uses a three-signal search pipeline--embedding cosine, binary Hamming similarity, and keyword reranking--to find results that any single method would miss. No GPU required.
+Built on the [Vector+ Lattice Engine](https://github.com/project-you-apps/vector-plus-studio), Membot uses a three-signal search pipeline--embedding cosine, binary Hamming similarity, and keyword reranking--to find results that any single method would miss. No GPU required. **No LLM required.**
+
+The entire memory substrate--build, store, search, recall--runs without a single LLM call. Embeddings come from a sentence transformer (Nomic). Search is binary math. Physics is Hebbian dynamics. The only AI that touches Membot is the agent on the other end deciding what to search for.
+
+> *The human brain doesn't need an LLM to remember things. Neither does Membot.*
 
 ![Membot Demo](docs/garfield-physics-demo.png)
 
@@ -220,6 +224,8 @@ See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working exa
 | `memory_store` | Store new text into the mounted cartridge |
 | `save_cartridge` | Persist the current cartridge to disk (secure NPZ format) |
 | `unmount` | Free memory and unload the current cartridge |
+| `get_passage` | Retrieve a specific passage by index (for navigation and drill-down) |
+| `passage_links` | Get navigation links (prev/next/parent/related) for a passage |
 | `get_status` | Server diagnostics (mounted cartridge, memory count, GPU status) |
 
 ## Depot Dashboard
@@ -451,6 +457,52 @@ If you mount a cart that exceeds available RAM (e.g., a 3 GB all-in-one cart on 
 
 **Prevention:** Use [split carts](#split-cart-format-index--sqlite) for large datasets on memory-constrained servers. A split cart keeps only the search index in RAM (~400 MB for 2.4M entries) with full text paged from disk via SQLite.
 
+## TUI Session Scanner
+
+Membot includes a scanner that captures OpenClaw TUI agent sessions and pushes them to a session memory server, giving TUI agents persistent memory across sessions.
+
+```bash
+# One-time scan (process all sessions, then exit)
+python tui_scanner.py --sessions-dir ~/.openclaw/agents --api-key YOUR_KEY --once
+
+# Continuous mode (scan every 120 seconds)
+python tui_scanner.py --sessions-dir ~/.openclaw/agents --api-key YOUR_KEY
+
+# Dry run (parse and format, don't push)
+python tui_scanner.py --sessions-dir ~/.openclaw/agents --dry-run --once
+```
+
+The scanner reads OpenClaw's JSONL session transcripts, extracts user/assistant exchange pairs, and pushes them to the session memory API. Each exchange is tagged with the agent name (`TUI-main`, `TUI-research-bot`, etc.) for filtering.
+
+A companion monitor script provides a clean, scrollable, color-coded view of TUI messages--no clobbering, no overwriting:
+
+```bash
+# Auto-find latest session and tail it
+python tui_monitor.py
+
+# Show full session history, then tail
+python tui_monitor.py --all
+```
+
+A startup script launches the scanner, OpenClaw gateway, TUI, and monitor in separate windows:
+
+```bash
+bash start-tui.sh
+```
+
+## What Makes Membot Different
+
+| | Membot | Typical AI Memory |
+|---|---|---|
+| **LLM dependency** | None. Search, store, and recall are LLM-free. | Every operation requires LLM calls (fact extraction, relationship building, compaction). |
+| **Storage model** | Portable brain cartridges--files you own and carry. | Cloud APIs, vendor lock-in, subscription pricing. |
+| **Search** | SimHash Hamming + keywords. Binary math, no neural inference. | Embedding cosine via API. Scales with token cost. |
+| **Association** | Hebbian attractor dynamics discover non-obvious connections. | Keyword/embedding overlap only. |
+| **Scale** | 4.8M entries on a $12/mo server. | Priced per query, per GB, per seat. |
+| **Physics** | Trained Hebbian weights, content-addressable recall, noise tolerance. | None. |
+
+The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. Membot's innovation is combining SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
+
 ## Security
 
 - **NPZ-first**: New cartridges are always saved as `.npz` (NumPy archive --no code execution)
@@ -487,8 +539,14 @@ membot/
 ├── membot_app.html               # Standalone web app (connects to any server)
 ├── cartridge_builder.py          # CLI tool to build cartridges from documents
 ├── build_gutenberg_cartridge.py  # Download + embed 44 Project Gutenberg classics
+├── build_sqlite_cart.py          # Convert .pkl cart to split format (index + SQLite)
+├── compress_cart.py              # Zlib-compress passages in a .pkl cart
 ├── multi_lattice_wrapper_v7.py   # Python wrapper for CUDA engine
 ├── requirements.txt
+├── tools/
+│   ├── tui_scanner.py            # OpenClaw TUI session scanner
+│   ├── tui_monitor.py            # Clean TUI message monitor (tail + pretty-print)
+│   └── start-tui.sh              # Launch scanner + gateway + TUI + monitor
 ├── bin/
 │   └── lattice_cuda_v7.dll       # Pre-built CUDA physics engine (Windows)
 ├── cartridges/                   # Your brain cartridges go here
