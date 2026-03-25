@@ -295,6 +295,16 @@ Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 mi
 
 Search uses the compact binary index (fast, no GPU). Recall uses the full lattice physics (noise-tolerant, associative). One substrate, two access modes.
 
+### Cross-Modal Association
+
+The lattice natively supports **multimodal associative recall**. Embed two different signals (e.g., image via CLIP, audio via CLAP), project them into a shared 768-dim vector, and train the lattice. The Hebbian weights encode the cross-modal association:
+
+- **Show it a picture → hear the sound.** Image cue → audio recalled (cosine 0.9998).
+- **Play a sound → see the picture.** Audio cue → image recalled (cosine 0.9969).
+- **Corrupt the input → clean recall.** 50% noise → denoised (cosine 0.9945).
+
+Three training passes. One pattern. No separate cross-modal model. The physics learns the binding between modalities through the same Hebbian mechanism that stores text. Any signal that can be embedded into a dense vector can participate in associative recall--text, vision, audio, or any combination.
+
 ## Brain Cartridges
 
 A brain cartridge is a self-contained memory unit:
@@ -432,6 +442,31 @@ sudo systemctl start membot
 
 **Requirements**: Python 3.10+ and ~2 GB RAM (SentenceTransformer model). No GPU needed for search.
 
+### Live Deployment
+
+Membot currently serves **4.8 million searchable entries** on a $12/month DigitalOcean droplet (2 GB RAM, 50 GB disk):
+
+| Cart | Entries | Index (RAM) | Text (disk) |
+|------|---------|-------------|-------------|
+| arXiv abstracts | 2,400,000 | 360 MB | 3.5 GB |
+| Wikipedia articles | 2,400,000 | 380 MB | 1.3 GB |
+
+Both carts use the split format. Total RAM usage: ~780 MB for indexes + ~300 MB for the embedding model. Both carts can be mounted simultaneously with room to spare on a 2 GB server.
+
+### Writable Agent Workspace
+
+For multi-agent deployments, run a second Membot instance in writable mode on a separate port. Agents can search the shared read-only carts AND create their own:
+
+```bash
+# Port 8000: read-only (public, shared carts)
+MEMBOT_API_KEY="read-key" python membot_server.py --transport http --port 8000
+
+# Port 8040: writable (agent workspace, separate API key)
+MEMBOT_API_KEY="agent-key" python membot_server.py --transport http --port 8040 --writable
+```
+
+The writable instance shares the same `cartridges/` directory, so agents can search the big carts and store findings to their own carts.
+
 ## Troubleshooting
 
 ### "Session not found" error (-32600)
@@ -500,6 +535,8 @@ bash start-tui.sh
 | **Association** | Hebbian attractor dynamics discover non-obvious connections. | Keyword/embedding overlap only. |
 | **Scale** | 4.8M entries on a $12/mo server. | Priced per query, per GB, per seat. |
 | **Physics** | Trained Hebbian weights, content-addressable recall, noise tolerance. | None. |
+| **Cross-modal** | Show a picture → hear the sound. Hebbian association, no separate model. | Not supported. |
+| **Energy** | Train once, query forever. No LLM calls in the pipeline. | Every ingest and query requires LLM inference. |
 
 The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. Membot's innovation is combining SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
 
@@ -526,7 +563,7 @@ The model downloads automatically on first run (~270 MB). Subsequent starts load
 | Component | Minimum | Recommended |
 |-----------|---------|-------------|
 | Python | 3.10+ | 3.12+ |
-| RAM | 4 GB | 16+ GB |
+| RAM | 2 GB (split carts) / 4 GB (standard carts) | 16+ GB |
 | GPU | None (search works without GPU) | NVIDIA RTX 3080+ (for lattice recall) |
 | VRAM | -- | 8+ GB |
 | CUDA | -- | 12.0+ |
