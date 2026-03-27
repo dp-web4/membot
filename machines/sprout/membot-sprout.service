@@ -1,0 +1,22 @@
+[Unit]
+Description=Membot Brain Cartridge Server (Sprout)
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=sprout
+Environment="HOME=/home/sprout"
+Environment="MEMBOT_EMBED_BACKEND=ollama"
+Environment="OLLAMA_HOST=http://localhost:11434"
+Environment="MEMBOT_OLLAMA_EMBED_MODEL=nomic-embed-text"
+WorkingDirectory=/home/sprout/ai-workspace/membot
+ExecStart=/usr/bin/python3 /home/sprout/ai-workspace/membot/membot_server.py --transport http --port 8000 --writable
+Restart=on-failure
+RestartSec=30
+MemoryMax=2G
+StandardOutput=append:/var/log/membot.log
+StandardError=append:/var/log/membot.log
+
+[Install]
+WantedBy=multi-user.target
