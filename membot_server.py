@@ -2353,4 +2353,7 @@ if __name__ == "__main__":
         if _server_config["read_only"]:
             log.info("Public server mode: write operations blocked")
 
-    mcp.run(transport=args.transport, host=args.host, port=args.port)
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        mcp.run(transport=args.transport, host=args.host, port=args.port)
