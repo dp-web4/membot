@@ -139,22 +139,24 @@ class TestSemanticReach(unittest.TestCase):
             raw = result.get("raw", "")
 
             # Parse scores from membot output
+            # Format: "#N (idx:M) [0.xyz] text..."
+            import re
             best_score = 0.0
             found_content = False
             for line in raw.split('\n'):
                 line = line.strip()
-                if not line or not line[0].isdigit():
+                if not line:
                     continue
-                score_match = None
-                import re
-                score_match = re.search(r'\[([0-9.]+)\]', line)
-                if score_match:
-                    score = float(score_match.group(1))
+                # Match result lines: #1 (idx:25) [0.735] content...
+                m = re.match(r'#\d+\s+\(idx:\d+\)\s+\[([0-9.]+)\]\s+(.*)', line)
+                if m:
+                    score = float(m.group(1))
+                    result_text = m.group(2)
                     if score > best_score:
                         best_score = score
-                    # Check if our content is in the results
+                    # Check if our content appears in this result
                     content_snippet = pair["content"][:40].lower()
-                    if content_snippet in line.lower():
+                    if content_snippet in result_text.lower():
                         found_content = True
 
             results_summary.append({
