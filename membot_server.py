@@ -272,10 +272,39 @@ def _resolve_session_id(session_id: str) -> str:
 
 
 # ============================================================
-# EMBEDDING VIA SENTENCE-TRANSFORMERS
+# EMBEDDING — Ollama backend (resource-constrained) or SentenceTransformer
 # ============================================================
 
-_embed_model = None  # lazy-loaded SentenceTransformer
+_embed_model = None  # lazy-loaded SentenceTransformer (if not using Ollama)
+_embed_backend = os.environ.get("MEMBOT_EMBED_BACKEND", "auto")  # "ollama", "st", or "auto"
+_ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+_ollama_embed_model = os.environ.get("MEMBOT_OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+def _ollama_available() -> bool:
+    """Check if Ollama is running and has the embedding model."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{_ollama_url}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+            models = [m["name"].split(":")[0] for m in data.get("models", [])]
+            return _ollama_embed_model.split(":")[0] in models
+    except Exception:
+        return False
+
+def _embed_via_ollama(text: str) -> np.ndarray:
+    """Get embedding from Ollama API (no extra RAM — reuses running Ollama process)."""
+    import urllib.request
+    payload = json.dumps({"model": _ollama_embed_model, "input": text}).encode()
+    req = urllib.request.Request(
+        f"{_ollama_url}/api/embed",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read())
+        return np.array(data["embeddings"][0], dtype=np.float32)
 
 def _get_embed_model():
     """Lazy-load SentenceTransformer (same model Studio uses to build cartridges)."""
@@ -289,11 +318,33 @@ def _get_embed_model():
         log.info("SentenceTransformer ready")
     return _embed_model
 
+def _resolve_embed_backend() -> str:
+    """Resolve which embedding backend to use."""
+    if _embed_backend == "ollama":
+        return "ollama"
+    if _embed_backend == "st":
+        return "st"
+    # auto: prefer Ollama if available (saves ~2GB RAM)
+    if _ollama_available():
+        log.info(f"Embedding backend: Ollama ({_ollama_embed_model}) — saves ~2GB RAM")
+        return "ollama"
+    log.info("Embedding backend: SentenceTransformer (Ollama not available)")
+    return "st"
+
+_resolved_backend = None
+
 def embed_text(text: str, prefix: str = "search_query") -> np.ndarray:
-    """Get 768-dim Nomic embedding via SentenceTransformer (matches Studio cartridge embedder)."""
-    model = _get_embed_model()
-    vec = model.encode(f"{prefix}: {text}", convert_to_numpy=True)
-    return vec.astype(np.float32)
+    """Get 768-dim Nomic embedding via Ollama or SentenceTransformer."""
+    global _resolved_backend
+    if _resolved_backend is None:
+        _resolved_backend = _resolve_embed_backend()
+
+    if _resolved_backend == "ollama":
+        return _embed_via_ollama(f"{prefix}: {text}")
+    else:
+        model = _get_embed_model()
+        vec = model.encode(f"{prefix}: {text}", convert_to_numpy=True)
+        return vec.astype(np.float32)
 
 
 # ============================================================
@@ -640,7 +691,8 @@ async def rest_store(request: Request) -> JSONResponse:
         content = data.get("content", "")
         tags = data.get("tags", "")
         _log_rest(request, "STORE", f"tags={tags} len={len(content)}")
-        result = memory_store.fn(
+        _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
+        result = _call(
             content=content,
             tags=tags,
             session_id=data.get("session_id", "")
@@ -878,7 +930,8 @@ async def rest_mount(request: Request) -> JSONResponse:
         session_id = data.get("session_id", "")
         if not name:
             return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
-        result = mount_cartridge.fn(name=name, session_id=session_id)
+        _call = getattr(mount_cartridge, 'fn', mount_cartridge)
+        result = _call(name=name, session_id=session_id)
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
@@ -955,7 +1008,8 @@ async def rest_save(request: Request) -> JSONResponse:
     if request.method == "OPTIONS":
         return JSONResponse({}, headers=_cors_headers())
     try:
-        result = save_cartridge.fn()
+        _call = getattr(save_cartridge, 'fn', save_cartridge)
+        result = _call()
         return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
