@@ -32,7 +32,7 @@
   <p>CLIP provides the image modality for cross-modal memory. When building a cartridge with images:</p>
   <ol style="margin:1rem 0 1rem 1.5rem;">
     <li>Each image is embedded using CLIP's image encoder</li>
-    <li>Each associated text is embedded using the text encoder (Nomic Embed)</li>
+    <li>Each associated text is embedded using <a href="embeddings.html">Nomic Embed</a> (the text encoder)</li>
     <li>Hebbian learning binds the image and text representations together</li>
   </ol>
   <p>After training, the neuromorphic layer can retrieve images from text queries or find text associated with similar images. Combined with CLAP (audio), this enables any-to-any modality search.</p>

@@ -26,11 +26,9 @@
 
   <h2>The architecture</h2>
   <ul style="margin:1rem 0 1rem 1.5rem;">
-    <li><strong>64&times;64 grid</strong> of neural regions</li>
-    <li><strong>64 regions</strong>, each representing a cluster of neurons</li>
-    <li><strong>~16M neurons</strong> across the full lattice</li>
+    <li><strong>64&times;64 grid</strong> of cells, each containing 64 neural units (64 &times; 64 &times; 64 = 262,144 units; with internal neuron populations per unit, the total is ~16M simulated neurons)</li>
     <li><strong>Hebbian weights</strong> &mdash; connections that strengthen when neurons fire together</li>
-    <li><strong>Mexican-hat inhibition</strong> &mdash; nearby neurons excite, distant neurons inhibit (sharpens recall)</li>
+    <li><strong>Mexican-hat inhibition</strong> &mdash; a connectivity pattern where nearby neurons excite each other while distant ones inhibit, sharpening activation patterns and suppressing noise (the same lateral inhibition mechanism found in biological visual cortex)</li>
     <li><strong>Energy dynamics</strong> &mdash; the network evolves to minimize an energy function, settling into stable attractor states</li>
   </ul>
 
@@ -43,12 +41,14 @@
   <p>Membot extends the classical Hopfield model with continuous activations, a spatial lattice structure, and multi-modal binding through Hebbian learning.</p>
 
   <h2>Validation</h2>
+  <p>The lattice has been validated on 1 million Wikipedia embeddings (768-dim Nomic vectors, queried with 1,000 held-out entries):</p>
   <table>
-    <tr><th>Metric</th><th>Result</th></tr>
-    <tr><td>Recall@1 at 1M entries</td><td>1.000</td></tr>
-    <tr><td>Erasure tolerance</td><td>Recovers from partial input</td></tr>
-    <tr><td>Bitflip tolerance</td><td>Recovers from noisy input</td></tr>
+    <tr><th>Metric</th><th>Result</th><th>Conditions</th></tr>
+    <tr><td>Recall@1</td><td>1.000</td><td>Clean query vectors &mdash; exact patterns presented to the lattice</td></tr>
+    <tr><td>Erasure tolerance</td><td>Recovers</td><td>Up to 30% of input dimensions zeroed out</td></tr>
+    <tr><td>Bitflip tolerance</td><td>Recovers</td><td>Up to 10% of sign bits randomly flipped</td></tr>
   </table>
+  <p style="font-size:0.85rem;color:var(--color-text-muted);margin-top:0.5rem;">Note: R@1=1.000 on clean queries reflects the lattice acting as a content-addressable store (like a Hopfield network) &mdash; it means stored patterns are faithfully recovered, not that the lattice outperforms embedding-based search on novel queries. See <a href="https://github.com/project-you-apps/membot" target="_blank">the repo</a> for test scripts and methodology.</p>
 
   <h2>Two access modes</h2>
   <p><strong>Search</strong> (binary, fast): Uses the sign-zero encoded vectors and Hamming distance. No physics simulation. Returns ranked results in milliseconds.</p>
