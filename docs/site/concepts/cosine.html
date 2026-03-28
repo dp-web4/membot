@@ -37,10 +37,10 @@
   <p>In practice, embedding models produce normalized vectors, so the magnitudes are 1 and cosine similarity reduces to a simple dot product.</p>
 
   <h2>In Membot</h2>
-  <p>Cosine similarity carries <strong>70%</strong> of the search weight. It is the semantic backbone &mdash; it understands that "canine" and "dog" are related even though they share no characters. The embeddings come from Nomic Embed, a local model that runs without API calls.</p>
+  <p>Cosine similarity carries <strong>70%</strong> of the search weight. It is the semantic backbone &mdash; it understands that "canine" and "dog" are related even though they share no characters. The embeddings come from <a href="embeddings.html">Nomic Embed</a>, a local 768-dimensional model that runs without API calls.</p>
 
   <h2>Why not cosine alone?</h2>
-  <p>Cosine captures meaning but can miss exact keywords. A query for "error code 4012" might match texts about errors in general but miss the one that contains the exact code. That's why Membot blends cosine with Hamming distance (which catches structural overlap) and keyword boosting (which catches exact matches).</p>
+  <p>Cosine captures meaning but can miss exact keywords. A query for "error code 4012" might match texts about errors in general but miss the one that contains the exact code. That's why Membot blends cosine with <a href="hamming.html">Hamming distance</a> (which provides a fast, coarse semantic check on binary signatures) and keyword boosting (which catches exact term matches).</p>
 
   <h2>Further reading</h2>
   <p>
