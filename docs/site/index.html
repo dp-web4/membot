@@ -11,6 +11,7 @@
 <!-- ── Navbar ──────────────────────────────────────────── -->
 <header class="navbar">
   <span class="logo">membot</span>
+  <button class="nav-toggle" aria-label="Menu">&#9776;</button>
   <nav>
     <a href="#what">What</a>
     <a href="#how">How</a>
@@ -347,5 +348,11 @@ python cartridge_builder.py paper.pdf --name paper</div>
   </p>
 </footer>
 
+<script>
+const toggle = document.querySelector('.nav-toggle');
+const nav = document.querySelector('.navbar nav');
+toggle.addEventListener('click', () => nav.classList.toggle('open'));
+nav.querySelectorAll('a').forEach(a => a.addEventListener('click', () => nav.classList.remove('open')));
+</script>
 </body>
 </html>

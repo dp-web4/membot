@@ -10,6 +10,7 @@
 
 <header class="navbar">
   <a class="logo" href="../index.html" style="text-decoration:none">membot</a>
+  <button class="nav-toggle" aria-label="Menu">&#9776;</button>
   <nav>
     <a href="../index.html">Home</a>
     <a href="../index.html#how">How It Works</a>
@@ -66,5 +67,11 @@
   <p><strong>membot</strong> &mdash; <a href="https://github.com/project-you-apps/membot">GitHub</a></p>
 </footer>
 
+<script>
+const toggle = document.querySelector(".nav-toggle");
+const nav = document.querySelector(".navbar nav");
+toggle.addEventListener("click", () => nav.classList.toggle("open"));
+nav.querySelectorAll("a").forEach(a => a.addEventListener("click", () => nav.classList.remove("open")));
+</script>
 </body>
 </html>
