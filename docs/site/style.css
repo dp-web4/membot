@@ -257,9 +257,10 @@ tr:hover td { background: rgba(34, 211, 238, 0.03); }
   opacity: 0;
   position: absolute;
   bottom: 100%;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 0;
+  transform: none;
   width: 280px;
+  max-width: 90vw;
   background: var(--surface);
   border: 1px solid var(--cyan);
   border-radius: 8px;
@@ -271,7 +272,6 @@ tr:hover td { background: rgba(34, 211, 238, 0.03); }
   pointer-events: none;
   transition: opacity 0.2s, visibility 0.2s;
   line-height: 1.5;
-  /* Invisible bridge below the tooltip so mouse can travel from text to tooltip */
   margin-bottom: 0;
 }
 
@@ -546,13 +546,6 @@ tr:hover td { background: rgba(34, 211, 238, 0.03); }
 
   .tip .tip-text {
     width: min(280px, 85vw);
-    left: 0;
-    transform: none;
-  }
-
-  .tip .tip-text::after {
-    left: 2rem;
-    transform: none;
   }
 
   .signal-row .label {

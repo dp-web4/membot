@@ -353,6 +353,26 @@ const toggle = document.querySelector('.nav-toggle');
 const nav = document.querySelector('.navbar nav');
 toggle.addEventListener('click', () => nav.classList.toggle('open'));
 nav.querySelectorAll('a').forEach(a => a.addEventListener('click', () => nav.classList.remove('open')));
+
+// Reposition tooltips that would overflow the viewport
+document.querySelectorAll('.tip').forEach(tip => {
+  tip.addEventListener('mouseenter', () => {
+    const tt = tip.querySelector('.tip-text');
+    if (!tt) return;
+    tt.style.left = '0';
+    tt.style.right = 'auto';
+    tt.style.transform = 'none';
+    const rect = tt.getBoundingClientRect();
+    if (rect.right > window.innerWidth - 8) {
+      tt.style.left = 'auto';
+      tt.style.right = '0';
+    }
+    if (rect.left < 8) {
+      tt.style.left = '0';
+      tt.style.right = 'auto';
+    }
+  });
+});
 </script>
 </body>
 </html>
