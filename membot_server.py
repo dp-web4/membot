@@ -2084,6 +2084,8 @@ def memory_search(query: str, top_k: int = 5, session_id: str = "", verbose: boo
             search_mode = "hamming-only"
             corpus_bin = state["binary_corpus"]
             scores = hamming_scores(query_emb, corpus_bin)
+            emb_scores = scores  # For verbose display compatibility
+            ham_scores = scores  # Raw Hamming scores are the only scores
             log.info(f"Hamming-only search: {len(corpus_bin)} patterns, packed={corpus_bin.shape[1] <= 96}")
 
         # 4. Keyword reranking — pull wider candidate pool, boost by keyword hits
