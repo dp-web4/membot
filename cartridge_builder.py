@@ -153,6 +153,15 @@ FLAG_PINNED     = 0x02
 FLAG_HAS_PARENT = 0x04
 FLAG_HAS_CHILD  = 0x08
 FLAG_HAS_SIBLING = 0x10
+# Perishability: bits 5-6 encode decay class
+# 00 = volatile (algorithmic time decay, pruneable)
+# 01 = replaceable (superseded by newer version)
+# 10 = archival (permanent, always accessible)
+# 11 = reserved
+FLAG_PERISH_MASK = 0x60
+FLAG_PERISH_VOLATILE    = 0x00  # default — routine entries
+FLAG_PERISH_REPLACEABLE = 0x20  # superseded on update
+FLAG_PERISH_ARCHIVAL    = 0x40  # permanent (reflections, discoveries, proven mechanics)
 
 
 def _source_hash(filename: str) -> int:
