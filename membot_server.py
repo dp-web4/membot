@@ -87,6 +87,7 @@ CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "self_contained_cart_test"),
 ]
 HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces physics L2)
+RECENCY_HALF_LIFE = 86400.0   # 24h — recency weight halves per day (0 = disabled)
 
 # --- Security Limits ---
 MAX_ENTRIES = 3_000_000      # Max memories per cartridge (supports 2.4M arXiv)
@@ -775,6 +776,16 @@ async def rest_search(request: Request) -> JSONResponse:
         candidate_k = min(max(top_k * 4, 20), len(scores))
         candidate_idx = np.argsort(scores)[-candidate_k:][::-1]
 
+        # Recency weighting: recent memories rank higher when similarity is close.
+        # Uses timestamps from hippocampus metadata if available.
+        # Formula: score * (0.5 + 0.5 * exp(-ln2 * age / half_life))
+        # At age=0: 1.0, at half_life: 0.75, at infinity: 0.5 floor.
+        import math
+        _ln2 = math.log(2)
+        now_ts = time.time()
+        hippo_meta = state.get("hippocampus_meta")  # list of parsed header dicts
+        has_recency = RECENCY_HALF_LIFE > 0 and hippo_meta is not None
+
         boosted = []
         for i in candidate_idx:
             base_score = float(scores[i])
@@ -783,7 +794,15 @@ async def rest_search(request: Request) -> JSONResponse:
             text_lower = state["texts"][i].lower()
             hits = sum(1 for kw in keywords if kw in text_lower)
             boost = min(hits * 0.03, 0.12)
-            boosted.append((i, base_score + boost))
+            final = base_score + boost
+            # Apply recency weight
+            if has_recency and i < len(hippo_meta):
+                entry_ts = hippo_meta[i].get("timestamp", 0)
+                if entry_ts > 0:
+                    age = max(0.0, now_ts - entry_ts)
+                    recency = 0.5 + 0.5 * math.exp(-_ln2 * age / RECENCY_HALF_LIFE)
+                    final *= recency
+            boosted.append((i, final))
 
         boosted.sort(key=lambda x: x[1], reverse=True)
         elapsed_ms = (time.time() - t0) * 1000
