@@ -57,6 +57,7 @@ import json
 import logging
 import argparse
 import collections
+import math
 import numpy as np
 
 # --- Logging (stderr only — stdout is reserved for MCP JSON-RPC) ---
@@ -780,7 +781,6 @@ async def rest_search(request: Request) -> JSONResponse:
         # Uses timestamps from hippocampus metadata if available.
         # Formula: score * (0.5 + 0.5 * exp(-ln2 * age / half_life))
         # At age=0: 1.0, at half_life: 0.75, at infinity: 0.5 floor.
-        import math
         _ln2 = math.log(2)
         now_ts = time.time()
         hippo_meta = state.get("hippocampus_meta")  # list of parsed header dicts
