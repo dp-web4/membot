@@ -1,5 +1,14 @@
 # Membot Devlog
 
+## 2026-04-01 — Membox RFC: Multi-User Neuromorphic DBMS
+
+Concept crystallized: extend Membot from single-user carts to multi-user DBMS with CRUD, locking, versioning, access control, and conflict resolution. Append-only version chains (Git for memories), DISPUTED flags for semantic conflicts, membox.txt for default permissions, admin agent template for automated governance. VPS = human frontend, MCP = agent backend, same cart.
+
+Full RFC: `docs/RFC/membox-multiuser-dbms-spec.md`
+Dedicated devlog: `docs/DEVLOG-MEMBOX.md`
+
+---
+
 ## 2026-03-24 — Wiki Brain Cart Deployed, Writable Agent Workspace, TUI Session Persistence Gap
 
 ### Wiki 2.4M Brain Cart — DEPLOYED TO DROPLET
