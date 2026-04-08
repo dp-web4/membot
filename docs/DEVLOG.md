@@ -1,5 +1,43 @@
 # Membot Devlog
 
+## 2026-04-08 (afternoon) — Membox Phase 1 SHIPPED — All Three Modes Live
+
+The third mode of the three-mode framework is now operational. Membot is the first **neuromorphic database** with single-user, federated multi-machine, AND multiuser-shared modes all running on the same substrate.
+
+### What landed
+
+- **`membot/membox.py`** — `CartLock` (write mutex with lease-based crash recovery), `imprint(cart_id, text, agent_id, ...)` convenience API, `search(cart_id, query)` (delegates to multi_cart, enriches results with `membox_meta`), `mount/unmount/list_mounts/status`. Reads never block on writes — classic many-readers-one-writer.
+- **`multi_cart.imprint_with_meta(cart_id, text, per_pattern_meta)`** — the general-purpose runtime imprint API used by Membox (and any future write path). Embeds new text, appends to in-memory state, persists the cart preserving hippocampus + pattern0 + per_pattern_meta + sign_bits + version. `_persist_cart()` is the on-disk write helper.
+- **9 new MCP tools**: `membox_mount`, `membox_unmount`, `membox_list`, `membox_imprint`, `membox_search`, `membox_acquire_lock`, `membox_release_lock`, `membox_lock_holder`, `membox_status`.
+- **`tests/test_membox.py`** — 11 tests, all pass first run. Mount, single-agent imprint, lock holder query, lock timeout under contention (~205ms), invalid release raises PermissionError, read never blocks (28ms while lock held), two-agent concurrent imprint via Python threads (both serialize correctly with unique local_addrs and proper attribution), agent_id stamping survives in per_pattern_meta, status reports per-agent write counts, lease-based crash recovery.
+- **Spec docs**: new `docs/RFC/membox-phase1-implementation.md` (concrete implementation spec), Amendment 2 added to `docs/RFC/membox-multiuser-dbms-spec.md` (Phase 1 SHIPPED marker + test results).
+- **README** "What's New" section updated to mark Membox Phase 1 SHIPPED with code example.
+
+### Performance numbers (RTX 4080 Super local)
+
+- First imprint: 2,131ms (Nomic cold load)
+- Subsequent imprints: ~19ms (warm cache + append + persist)
+- Read while write lock held: 28ms (zero blocking)
+- ~50 writes/sec per agent under contention
+
+### Why this matters
+
+Multi-cart query (foundation) + Federation (multi-machine) were powerful but invisible to a non-technical observer. Membox is the **product unlock** because it has a 90-second visible demo: two textareas, two agents, both writing to the same cart with serialized attribution, lock indicator showing who's holding the write lock right now. That's the demo an angel investor can grasp in 30 seconds because they've used Google Docs.
+
+The pitch becomes "Google Docs for AI memory." Phase 2 (version chains + dispute detection) adds the conflict-resolution UI moment. Phase 3 (permissions) makes it multi-tenant. Phase 4 (admin agent) handles HITL workflows. Phase 5 (VPS integration) makes it the visible product.
+
+Andy's framing: *"This multi-user/multi-cart feature that gives us true CRUD suddenly puts project-you over the top. And it potentially moves VPS into being an actual product I can pitch to angels that they might understand BY SHOWING IT TO THEM DIRECTLY."*
+
+### Status of all three modes
+
+- ✅ **Single-user** (legacy Membot, untouched)
+- ✅ **Federated** (Phase 1 shipped 2026-04-08 morning, production-validated by Dennis on Nomad — see `DEVLOG-SAGE-COLLAB.md`)
+- ✅ **Multiuser/Membox** (Phase 1 shipped 2026-04-08 afternoon, 11/11 tests pass)
+
+PR #11 on `project-you-apps/membot`, branch `claude/federate-phase-1`, will get a new commit containing all of this Membox work.
+
+---
+
 ## 2026-04-08 — Multi-Cart Phase 1 + Federate Phase 1 + scope_mode polish
 
 The substrate change that turns Membot from a single-relation library into a multi-relation neuromorphic database. Three commits on PR #11 (project-you-apps/membot, branch `claude/federate-phase-1`):

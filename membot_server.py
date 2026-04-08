@@ -2705,6 +2705,262 @@ def federate_load(fleet_dir: str) -> str:
         return f"federate_load failed: {e}"
 
 
+# =============================================================================
+# MEMBOX — Multi-user shared cart with locking + agent attribution
+# =============================================================================
+# Spec: docs/RFC/membox-phase1-implementation.md
+# Implementation: membox.py (built on multi_cart.py)
+#
+# Membox is the third mode of the three-mode framework (single-user / federated
+# / multiuser). Multiple agents safely write to the same cart with per-agent
+# attribution and a write mutex that guarantees serialization without blocking
+# reads. Phase 1 ships locking + tagging only — version chains, dispute
+# detection, and permissions come in Phases 2-4.
+
+import membox as _mb
+
+
+@mcp.tool()
+def membox_mount(cart_path: str, cart_id: str = "", role: str = "",
+                 lease_seconds: int = 30, verify_integrity: bool = True) -> str:
+    """Mount a brain cart in Membox mode (multi-user shared with locking).
+
+    Multiple agents can write to the cart safely via membox_imprint, with
+    each write attributed to the calling agent_id. Reads via membox_search
+    never block on the write lock.
+
+    Args:
+        cart_path: Filesystem path to the cart file (.npz, .pkl, or split format)
+        cart_id: Stable identifier for the mount (defaults to filename)
+        role: Optional semantic tag (e.g. 'team_kb', 'project_notes')
+        lease_seconds: Auto-release timeout if a holder crashes (default 30)
+        verify_integrity: Reject carts with stale manifests (default True)
+    """
+    log.info(f"membox_mount({cart_path}, cart_id={cart_id!r}, role={role!r}, lease={lease_seconds}s)")
+    try:
+        result = _mb.mount(
+            cart_path,
+            cart_id=cart_id or None,
+            role=role or None,
+            lease_seconds=lease_seconds,
+            verify_integrity=verify_integrity,
+        )
+        return (
+            f"Mounted '{result['cart_id']}' in Membox mode "
+            f"(role={result.get('role')}, n_patterns={result['n_patterns']}, "
+            f"lease={result['lease_seconds']}s)"
+        )
+    except Exception as e:
+        return f"membox_mount failed: {e}"
+
+
+@mcp.tool()
+def membox_unmount(cart_id: str) -> str:
+    """Unmount a Membox cart. Releases the lock if held."""
+    log.info(f"membox_unmount({cart_id})")
+    try:
+        result = _mb.unmount(cart_id)
+        return f"Unmounted Membox cart '{cart_id}' (was {result.get('n_patterns', '?')} patterns)"
+    except Exception as e:
+        return f"membox_unmount failed: {e}"
+
+
+@mcp.tool()
+def membox_list() -> str:
+    """List every Membox-mounted cart with current lock state and write stats."""
+    log.info("membox_list()")
+    try:
+        mounts = _mb.list_mounts()
+        if not mounts:
+            return "No carts mounted in Membox mode."
+        lines = [f"Membox pool: {len(mounts)} carts"]
+        for m in mounts:
+            lock = m["lock"]
+            holder = lock.get("holder") or "(idle)"
+            lines.append(
+                f"  '{m['cart_id']}' role={m.get('role')} "
+                f"n_patterns={m['n_patterns']} "
+                f"lock_holder={holder} "
+                f"acquires={lock.get('acquire_count', 0)}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"membox_list failed: {e}"
+
+
+@mcp.tool()
+def membox_imprint(cart_id: str, text: str, agent_id: str,
+                   tags: str = "", reasoning: str = "",
+                   origin: str = "agent", timeout_ms: int = 5000) -> str:
+    """Write a new pattern to a Membox cart with agent_id attribution.
+
+    Acquires the write lock, writes the pattern with full per-agent metadata
+    (agent_id, written_at, origin, tags, reasoning), releases the lock.
+    Returns the new local_addr or an error if the lock can't be acquired
+    within timeout_ms.
+
+    Args:
+        cart_id: Membox-mounted cart to write to
+        text: Pattern text content (the thing to embed and store)
+        agent_id: Who's writing — REQUIRED, no anonymous writes in Membox
+        tags: Optional comma-separated tags
+        reasoning: Optional explanation of WHY this is being written (audit trail)
+        origin: 'agent' (default) | 'human' | 'system'
+        timeout_ms: How long to wait for the write lock (default 5000)
+    """
+    log.info(f"membox_imprint(cart_id={cart_id}, agent={agent_id}, text_len={len(text)})")
+    try:
+        result = _mb.imprint(
+            cart_id, text=text, agent_id=agent_id,
+            tags=tags, reasoning=reasoning, origin=origin,
+            timeout_ms=timeout_ms,
+        )
+    except ValueError as e:
+        return f"membox_imprint error: {e}"
+    except Exception as e:
+        return f"membox_imprint failed: {e}"
+
+    if not result.get("ok"):
+        if result.get("error") == "lock_timeout":
+            return (
+                f"Lock timeout — cart '{cart_id}' is currently held by "
+                f"{result.get('current_holder')!r}. Try again or increase timeout_ms."
+            )
+        return f"membox_imprint failed: {result.get('error')}"
+
+    return (
+        f"Imprinted to '{cart_id}' as agent {agent_id!r} "
+        f"at local_addr={result['local_addr']} (written_at={result['written_at']})"
+    )
+
+
+@mcp.tool()
+def membox_search(cart_id: str, query: str, top_k: int = 10,
+                  agent_id: str = "") -> str:
+    """Search a Membox cart. Never blocks on the write lock — reads always
+    succeed even while another agent is writing.
+
+    Returns ranked results with per-pattern Membox metadata visible
+    (agent_id, written_at, origin, reasoning, tags) so the consumer can
+    see who wrote what.
+
+    Args:
+        cart_id: Membox-mounted cart to search
+        query: Natural language query
+        top_k: Max results to return (default 10)
+        agent_id: Optional — who's reading (for audit logging in Phase 4)
+    """
+    if len(query) > MAX_QUERY_LENGTH:
+        return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
+    log.info(f"membox_search(cart_id={cart_id}, query={query[:60]!r})")
+
+    try:
+        result = _mb.search(cart_id, query, top_k=top_k, agent_id=agent_id or None)
+    except ValueError as e:
+        return f"membox_search error: {e}"
+    except Exception as e:
+        return f"membox_search failed: {e}"
+
+    results = result.get("results", [])
+    if not results:
+        return f"No results for '{query}' in '{cart_id}' ({result.get('elapsed_ms', '?')}ms)"
+
+    lines = [f"membox_search '{cart_id}': {len(results)} results in {result.get('elapsed_ms', '?')}ms\n"]
+    for rank, r in enumerate(results, 1):
+        if r.get("score", 0) < 0.1:
+            continue
+        membox_meta = r.get("membox_meta") or {}
+        attrib = ""
+        if isinstance(membox_meta, dict) and membox_meta.get("agent_id"):
+            written = membox_meta.get("written_at", "")
+            attrib = f"  [agent={membox_meta['agent_id']} @ {written[:19]}]"
+        lines.append(f"#{rank} [#{r['local_addr']}] [{r['score']:.3f}]{attrib} {r['text'][:300]}")
+    return "\n\n".join(lines)
+
+
+@mcp.tool()
+def membox_acquire_lock(cart_id: str, agent_id: str, timeout_ms: int = 5000) -> str:
+    """Manually acquire the write lock on a Membox cart. Most callers should
+    use membox_imprint instead, which handles acquire+write+release atomically.
+
+    Use this directly only when you need to do multiple writes in sequence
+    without releasing the lock between them.
+
+    Args:
+        cart_id: Membox-mounted cart
+        agent_id: Who's acquiring (required)
+        timeout_ms: How long to wait if the lock is held (default 5000)
+    """
+    log.info(f"membox_acquire_lock(cart_id={cart_id}, agent={agent_id})")
+    try:
+        ok = _mb.acquire_lock(cart_id, agent_id, timeout_ms=timeout_ms)
+    except ValueError as e:
+        return f"membox_acquire_lock error: {e}"
+    if ok:
+        return f"Lock acquired on '{cart_id}' by agent {agent_id!r}"
+    holder = _mb.lock_holder(cart_id)
+    return f"Lock timeout — '{cart_id}' is held by {holder!r}, try again or increase timeout_ms"
+
+
+@mcp.tool()
+def membox_release_lock(cart_id: str, agent_id: str) -> str:
+    """Release the write lock on a Membox cart. Only the current holder may release.
+
+    Args:
+        cart_id: Membox-mounted cart
+        agent_id: The agent currently holding the lock
+    """
+    log.info(f"membox_release_lock(cart_id={cart_id}, agent={agent_id})")
+    try:
+        _mb.release_lock(cart_id, agent_id)
+        return f"Lock released on '{cart_id}' by agent {agent_id!r}"
+    except (ValueError, PermissionError, RuntimeError) as e:
+        return f"membox_release_lock error: {e}"
+
+
+@mcp.tool()
+def membox_lock_holder(cart_id: str) -> str:
+    """Return the agent_id currently holding the write lock, or '(idle)'."""
+    log.info(f"membox_lock_holder(cart_id={cart_id})")
+    try:
+        holder = _mb.lock_holder(cart_id)
+    except ValueError as e:
+        return f"membox_lock_holder error: {e}"
+    if holder is None:
+        return f"'{cart_id}': lock is idle"
+    return f"'{cart_id}': lock held by agent {holder!r}"
+
+
+@mcp.tool()
+def membox_status(cart_id: str) -> str:
+    """Return Membox status for a cart: lock state, write counts per agent,
+    pattern count, recent write log.
+    """
+    log.info(f"membox_status(cart_id={cart_id})")
+    try:
+        s = _mb.status(cart_id)
+    except ValueError as e:
+        return f"membox_status error: {e}"
+    lines = [
+        f"Membox status for '{cart_id}':",
+        f"  Patterns: {s['n_patterns']}",
+        f"  Lock holder: {s['lock'].get('holder') or '(idle)'}",
+        f"  Lock acquires: {s['lock'].get('acquire_count', 0)}",
+        f"  Lock waits: {s['lock'].get('wait_count', 0)}",
+        f"  Writes by agent:",
+    ]
+    for agent, count in sorted(s["writes_by_agent"].items()):
+        lines.append(f"    {agent}: {count}")
+    if s.get("recent_writes"):
+        lines.append(f"  Recent writes (last {len(s['recent_writes'])}):")
+        for w in s["recent_writes"]:
+            lines.append(
+                f"    [{w['written_at'][:19]}] {w['agent_id']} → addr={w['local_addr']}: "
+                f"{w['text_preview'][:80]}"
+            )
+    return "\n".join(lines)
+
+
 @mcp.tool()
 def get_status(session_id: str = "") -> str:
     """Get server status: mounted cartridge, memory count, GPU availability.

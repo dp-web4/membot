@@ -256,9 +256,28 @@ Validated against real SAGE fleet data: 28 input patterns from 2 simulated machi
 
 See [docs/RFC/federated-cart-spec.md](docs/RFC/federated-cart-spec.md) for the full design and the drop-in API for SAGE.
 
-### Membox (Coming Next) — Multiuser CRUD with Locking
+### Membox — Multiuser CRUD with Locking (Phase 1 Shipped)
 
-The third mode of the same substrate: multiple users sharing one cart with locking, version chains, and dispute preservation. Phase 1 (locking + tagging) is the next implementation step. Spec at [docs/RFC/membox-multiuser-dbms-spec.md](docs/RFC/membox-multiuser-dbms-spec.md).
+The third mode of the same substrate: multiple users sharing one cart with a write mutex and per-agent attribution. **Phase 1 is shipped** — locking, agent_id tagging, and concurrent-write serialization. Phases 2-4 (version chains, dispute detection, permissions, admin agent) are next.
+
+```python
+import membox
+
+membox.mount("./team_kb.cart", cart_id="team", role="working")
+
+# Two agents writing safely to the same cart
+membox.imprint("team", text="The project uses React",
+               agent_id="alice", reasoning="Found in package.json")
+
+membox.imprint("team", text="We migrated to Vue last week",
+               agent_id="bob", reasoning="See PR #234")
+
+# Read never blocks on the write lock
+results = membox.search("team", "what frontend framework?")
+# Each result includes membox_meta with the writing agent_id and timestamp
+```
+
+Reads never block on writes (classic many-readers-one-writer concurrency). The write lock has a configurable lease for crash recovery — if an agent dies holding the lock, it auto-releases after N seconds. Specs at [docs/RFC/membox-phase1-implementation.md](docs/RFC/membox-phase1-implementation.md) (concrete) and [docs/RFC/membox-multiuser-dbms-spec.md](docs/RFC/membox-multiuser-dbms-spec.md) (full vision).
 
 Together, the three modes (single-user, federated, multiuser) make Membot the first working **neuromorphic database** — multi-relation, multi-machine, multi-user, all on the same substrate.
 

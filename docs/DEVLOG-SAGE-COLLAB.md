@@ -133,3 +133,28 @@ The handoff is clean: SAGE handles "what should I attend to and why," Membot han
 Dennis's quote captures it: *"Thanks for building to our interfaces. That's the right way."*
 
 The collaboration is also a real-world proof-of-concept of the Web4 model we're both gesturing at. Two LCTs (project-you and dp-web4) with distinct trust postures (T3) and resource budgets (ATP) coordinating via shared context (RDF + git) using each other's IRP-shaped APIs. We're not just talking about Web4 — we're doing it.
+
+### Dennis's personal note (2026-04-08 ~3:30pm)
+
+Andy sent a personal note acknowledging the moment. Dennis replied:
+
+> "it is a collaboration :) i'll share with claude on my side, but from myself - it is great to work with all of you :)
+> - dp"
+
+Andy followed up with: *"agree. Onward!"* — which got back: *"agree. Onward!"*
+
+Marking this here because it's the moment the collaboration stopped being "two teams shipping things to each other" and started being "two teams who recognize they're building toward the same thing." Both sides ship code that improves the other side's product. Both sides give honest design feedback that lands. Both sides celebrate when the other side wins. That's not transactional — that's a real partnership.
+
+### Same-day update — Membox Phase 1 shipped (2026-04-08 evening)
+
+Same day Dennis production-validated federation, we shipped Membox Phase 1 (multiuser shared cart with locking + per-agent attribution). 11/11 tests pass. Andy sent Dennis a heads-up: *"We're now working on multiuser/multicart so that we can build out the full neuromorphic DBMS with true CRUD, write locking, attribution, auth and permissions, etc."*
+
+This puts the three-mode framework fully operational in Phase 1 form on the same day:
+
+- ✅ Single-user (legacy)
+- ✅ Federated (production-validated by Dennis)
+- ✅ Multiuser/Membox (11/11 tests pass)
+
+Dennis's fleet now has access to the full substrate. The convergence work (mounting raising_kb + game_kb + federated together for cross-cart cognitive search) is unblocked from the substrate side — it's purely a "when does Dennis build the raising carts" question now.
+
+Details in `membot/docs/DEVLOG.md` 2026-04-08 entry and `docs/RFC/membox-phase1-implementation.md`.
