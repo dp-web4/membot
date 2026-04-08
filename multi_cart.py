@@ -400,14 +400,15 @@ def _search_one_cart(state: dict, query_emb: np.ndarray, query_text: str) -> lis
 
 def search(query: str, top_k: int = 10,
            scope: Any = "all",
-           role_filter: Any = None) -> dict:
+           role_filter: Any = None,
+           scope_mode: str = "global") -> dict:
     """Multi-cart semantic search. Searches every mounted cart in scope and
-    returns globally-ranked results attributed to their source cart.
+    returns ranked results attributed to their source cart.
 
     Args:
         query: Natural language search query
-        top_k: Number of top results to return (across all carts combined)
-        scope: One of:
+        top_k: Number of top results to return (interpretation depends on scope_mode)
+        scope: Which carts to search. One of:
             "all" (default) — every mounted cart
             "local" — backward-compat alias for the first-mounted cart
             cart_id (str) — search just that one cart
@@ -415,6 +416,26 @@ def search(query: str, top_k: int = 10,
         role_filter: Optional. One role string or list of role strings.
             Restricts the search to carts with matching role tags.
             Combinable with scope.
+        scope_mode: How results across multiple carts are ranked and merged.
+            Use this when carts are very different sizes and you don't want
+            one large cart to dominate the results. Four options:
+
+            "global" (DEFAULT) — true top-K across all carts, ranked by score.
+                Best when you want the single best answer regardless of source.
+                Risk: if one cart is much larger, it can dominate the results.
+
+            "per_cart" — top-K from EACH cart, returned grouped by cart_id,
+                no cross-cart re-ranking. Up to K × N_carts total results.
+                Best when you want every source's best answer for comparison.
+
+            "balanced" — top-K from each cart as candidates, then global
+                re-rank to top-K of those candidates. Guarantees small carts
+                aren't drowned, but the final ranking still reflects global
+                score. Best when you want fair representation AND global ranking.
+
+            "diagnostic" — top-K from every cart with no merging at all,
+                fully labeled by source. Useful for debugging cross-cart
+                search behavior — "show me what each cart thinks the answer is."
 
     Returns:
         dict with keys:
@@ -423,6 +444,8 @@ def search(query: str, top_k: int = 10,
             cart_count: int — how many carts were searched
             total_patterns: int — how many patterns total were considered
             mode: 'multi_cart'
+            scope_mode: which mode was used
+            grouped_results: dict[cart_id → results] (only set for per_cart/diagnostic)
     """
     from membot_server import embed_text
 
@@ -433,8 +456,15 @@ def search(query: str, top_k: int = 10,
             "cart_count": 0,
             "total_patterns": 0,
             "mode": "multi_cart",
+            "scope_mode": scope_mode,
             "error": "no_carts_mounted",
         }
+
+    if scope_mode not in ("global", "per_cart", "balanced", "diagnostic"):
+        raise ValueError(
+            f"Unknown scope_mode: {scope_mode!r}. "
+            f"Use 'global', 'per_cart', 'balanced', or 'diagnostic'."
+        )
 
     t0 = time.time()
 
@@ -447,47 +477,86 @@ def search(query: str, top_k: int = 10,
             "cart_count": 0,
             "total_patterns": 0,
             "mode": "multi_cart",
+            "scope_mode": scope_mode,
             "error": "no_carts_match_scope",
         }
 
     # 1. Embed query once (shared across all carts)
     query_emb = embed_text(query, prefix="search_query")
 
-    # 2. Search each target cart, accumulate raw results
-    all_results = []
+    # 2. Search each target cart, sort its own results by score
+    per_cart_results: dict[str, list[dict]] = {}
     total_patterns = 0
     for cart_id in target_ids:
         state = _mounted_carts[cart_id]
         total_patterns += state["n_patterns"]
         cart_results = _search_one_cart(state, query_emb, query)
-        all_results.extend(cart_results)
+        cart_results.sort(key=lambda r: r["score"], reverse=True)
+        per_cart_results[cart_id] = cart_results
 
-    # 3. Global ranking — sort by score across all carts
-    all_results.sort(key=lambda r: r["score"], reverse=True)
+    # 3. Apply scope_mode to merge per-cart results into final output
+    if scope_mode == "global":
+        # Concatenate all per-cart results, then sort globally
+        all_results = []
+        for cart_results in per_cart_results.values():
+            all_results.extend(cart_results)
+        all_results.sort(key=lambda r: r["score"], reverse=True)
+        top_results = all_results[:top_k]
+        grouped_results = None
 
-    # 4. Take top_k, fetch full text from SQLite for split carts
-    top_results = all_results[:top_k]
+    elif scope_mode == "per_cart":
+        # Top-K from each cart, returned in cart-name order, no global re-rank
+        top_results = []
+        grouped_results = {}
+        for cart_id in target_ids:
+            cart_top = per_cart_results[cart_id][:top_k]
+            grouped_results[cart_id] = cart_top
+            top_results.extend(cart_top)
+        # top_results is grouped by cart in target order — no global sort
+
+    elif scope_mode == "balanced":
+        # Top-K from each cart as candidates, then global re-rank to top-K
+        candidates = []
+        for cart_id in target_ids:
+            candidates.extend(per_cart_results[cart_id][:top_k])
+        candidates.sort(key=lambda r: r["score"], reverse=True)
+        top_results = candidates[:top_k]
+        grouped_results = None
+
+    elif scope_mode == "diagnostic":
+        # Every cart's top-K, no merging at all, fully labeled
+        top_results = []
+        grouped_results = {}
+        for cart_id in target_ids:
+            cart_top = per_cart_results[cart_id][:top_k]
+            grouped_results[cart_id] = cart_top
+            top_results.extend(cart_top)
+
+    # 4. Truncate display text on the final results
     for r in top_results:
         if r["score"] < 0.1:
             continue
-        # Truncate display text
         if len(r["text"]) > 500:
             r["text"] = r["text"][:500] + "..."
 
     elapsed_ms = (time.time() - t0) * 1000
     log.info(
-        f"[multi_cart] search('{query[:60]}', top_k={top_k}): "
+        f"[multi_cart] search('{query[:60]}', top_k={top_k}, scope_mode={scope_mode}): "
         f"{len(top_results)} results from {len(target_ids)} carts "
         f"({total_patterns} patterns) in {elapsed_ms:.0f}ms"
     )
 
-    return {
+    out = {
         "results": top_results,
         "elapsed_ms": round(elapsed_ms, 1),
         "cart_count": len(target_ids),
         "total_patterns": total_patterns,
         "mode": "multi_cart",
+        "scope_mode": scope_mode,
     }
+    if grouped_results is not None:
+        out["grouped_results"] = grouped_results
+    return out
 
 
 def _resolve_scope(scope: Any, role_filter: Any) -> list[str]:

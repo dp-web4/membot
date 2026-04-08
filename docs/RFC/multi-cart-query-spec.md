@@ -386,4 +386,4 @@ Phase 3 is being designed.
 
 ### Status
 
-Filed for implementation tomorrow. ~30 lines + tests.
+**Shipped 2026-04-08** in the same branch as the original Phase 1 PR (claude/federate-phase-1). The new `scope_mode` parameter defaults to `"global"` (backward-compatible). `per_cart` and `diagnostic` modes additionally return a `grouped_results` dict in the response so the caller can see results organized by source cart. The MCP tool `multi_search` exposes the parameter, and `tests/test_multi_cart.py` exercises all four modes plus the invalid-mode error path.

@@ -2471,20 +2471,34 @@ def multi_mount_directory(dir_path: str, role: str = "", pattern: str = "*.cart"
 
 @mcp.tool()
 def multi_search(query: str, top_k: int = 10, scope: str = "all",
-                 role_filter: str = "") -> str:
+                 role_filter: str = "", scope_mode: str = "global") -> str:
     """Search across every mounted cart in the multi-cart pool. Results are
-    globally ranked and attributed to their source cart.
+    ranked and attributed to their source cart.
 
     Args:
         query: Natural language search query
-        top_k: Number of top results to return across all carts (default 10)
+        top_k: Number of top results to return (interpretation depends on scope_mode)
         scope: 'all' (default), 'local' (first cart only), or a specific cart_id
         role_filter: Optional role tag to restrict the search to matching carts
                      (e.g. 'federated' to search only federated-mode carts)
+        scope_mode: How results across carts are ranked. Use this when carts
+                    are very different sizes and you don't want one large cart
+                    to dominate the results. Options:
+                    - 'global' (default): true top-K across all carts. Best
+                      for "what's the single best answer regardless of source?"
+                    - 'per_cart': top-K from EACH cart, no cross-cart re-ranking.
+                      Returns up to K × N_carts results. Best for "show me each
+                      source's best answer for comparison."
+                    - 'balanced': top-K candidates per cart, then globally rerank
+                      to top-K. Guarantees small carts aren't drowned but the
+                      final ranking still reflects global score. Best when
+                      you want fair representation AND global ranking.
+                    - 'diagnostic': top-K from every cart, no merging at all,
+                      fully labeled. Useful for debugging.
     """
     if len(query) > MAX_QUERY_LENGTH:
         return f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
-    log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r})")
+    log.info(f"multi_search('{query[:60]}', top_k={top_k}, scope={scope!r}, role_filter={role_filter!r}, scope_mode={scope_mode!r})")
 
     try:
         result = _mc.search(
@@ -2492,7 +2506,10 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
             top_k=top_k,
             scope=scope,
             role_filter=role_filter or None,
+            scope_mode=scope_mode,
         )
+    except ValueError as e:
+        return f"multi_search error: {e}"
     except Exception as e:
         return f"multi_search error: {e}"
 
@@ -2504,23 +2521,42 @@ def multi_search(query: str, top_k: int = 10, scope: str = "all",
         return (
             f"No relevant matches for '{query}' "
             f"(searched {result['cart_count']} carts, "
-            f"{result['total_patterns']} patterns, {result['elapsed_ms']}ms)"
+            f"{result['total_patterns']} patterns, {result['elapsed_ms']}ms, "
+            f"scope_mode={scope_mode})"
         )
 
     header = (
-        f"multi_search [scope={scope}, role_filter={role_filter or 'any'}]: "
+        f"multi_search [scope={scope}, role_filter={role_filter or 'any'}, "
+        f"scope_mode={scope_mode}]: "
         f"{len(results)} results from {result['cart_count']} carts "
         f"({result['total_patterns']} patterns, {result['elapsed_ms']}ms)\n"
     )
     lines = [header]
-    for rank, r in enumerate(results, 1):
-        if r["score"] < 0.1:
-            continue
-        cart_label = f"[{r['cart_id']}"
-        if r.get("role"):
-            cart_label += f"/{r['role']}"
-        cart_label += f"#{r['local_addr']}]"
-        lines.append(f"#{rank} {cart_label} [{r['score']:.3f}] {r['text']}")
+
+    # For per_cart and diagnostic modes, group output by cart_id for readability
+    grouped = result.get("grouped_results")
+    if grouped and scope_mode in ("per_cart", "diagnostic"):
+        for cart_id, cart_results in grouped.items():
+            if not cart_results:
+                continue
+            role_tag = ""
+            if cart_results[0].get("role"):
+                role_tag = f"/{cart_results[0]['role']}"
+            lines.append(f"\n=== {cart_id}{role_tag} ===")
+            for rank, r in enumerate(cart_results, 1):
+                if r["score"] < 0.1:
+                    continue
+                lines.append(f"#{rank} [#{r['local_addr']}] [{r['score']:.3f}] {r['text']}")
+    else:
+        # Global / balanced — flat list with full attribution per result
+        for rank, r in enumerate(results, 1):
+            if r["score"] < 0.1:
+                continue
+            cart_label = f"[{r['cart_id']}"
+            if r.get("role"):
+                cart_label += f"/{r['role']}"
+            cart_label += f"#{r['local_addr']}]"
+            lines.append(f"#{rank} {cart_label} [{r['score']:.3f}] {r['text']}")
     return "\n\n".join(lines)
 
 

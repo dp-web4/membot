@@ -139,6 +139,60 @@ def main():
     except Exception as e:
         print(f"  FAIL: {e}")
 
+    # --- Test 6b: scope_mode variants (the small-cart-not-drowned fix) ---
+    print()
+    print("--- Test 6b: scope_mode variants ---")
+    try:
+        # global mode (default) — true top-K across all
+        global_result = mc.search(test_query, top_k=3, scope="all", scope_mode="global")
+        global_carts_hit = set(r["cart_id"] for r in global_result["results"])
+        print(f"  global: {len(global_result['results'])} results from carts {global_carts_hit}")
+        assert global_result["scope_mode"] == "global"
+
+        # per_cart mode — top-K from each cart, no global rerank
+        per_cart_result = mc.search(test_query, top_k=3, scope="all", scope_mode="per_cart")
+        per_cart_carts_hit = set(r["cart_id"] for r in per_cart_result["results"])
+        print(f"  per_cart: {len(per_cart_result['results'])} results from carts {per_cart_carts_hit}")
+        print(f"  per_cart grouped_results keys: {list(per_cart_result.get('grouped_results', {}).keys())}")
+        assert per_cart_result["scope_mode"] == "per_cart"
+        assert "grouped_results" in per_cart_result
+        # per_cart with 2 carts and top_k=3 should return up to 6 results (3 from each)
+        # And both carts should be represented even if one is much smaller
+        assert len(per_cart_carts_hit) == per_cart_result["cart_count"], (
+            f"per_cart should return results from every cart: got {per_cart_carts_hit} "
+            f"vs {per_cart_result['cart_count']} carts"
+        )
+
+        # balanced mode — top-K candidates per cart, then global rerank
+        balanced_result = mc.search(test_query, top_k=3, scope="all", scope_mode="balanced")
+        balanced_carts_hit = set(r["cart_id"] for r in balanced_result["results"])
+        print(f"  balanced: {len(balanced_result['results'])} results from carts {balanced_carts_hit}")
+        assert balanced_result["scope_mode"] == "balanced"
+        # balanced returns top_k total (not top_k per cart)
+        assert len(balanced_result["results"]) <= 3, (
+            f"balanced should return at most top_k={3} results, got {len(balanced_result['results'])}"
+        )
+
+        # diagnostic mode — every cart's top-K, fully labeled
+        diag_result = mc.search(test_query, top_k=3, scope="all", scope_mode="diagnostic")
+        print(f"  diagnostic: {len(diag_result['results'])} results "
+              f"(grouped_results: {list(diag_result.get('grouped_results', {}).keys())})")
+        assert diag_result["scope_mode"] == "diagnostic"
+        assert "grouped_results" in diag_result
+
+        # invalid scope_mode should error cleanly
+        try:
+            mc.search(test_query, top_k=3, scope="all", scope_mode="bogus")
+            print("  FAIL: invalid scope_mode should have raised")
+        except ValueError as e:
+            print(f"  invalid scope_mode raises ValueError: PASS")
+
+        print("  scope_mode variants check: PASS")
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        import traceback
+        traceback.print_exc()
+
     # --- Test 7: collision detection ---
     print()
     print("--- Test 7: cart_id collision should error ---")
