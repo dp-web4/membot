@@ -8,6 +8,18 @@ For project-level history, see `../docs/DEVLOG-ONGOING.md` in project-you root.
 
 ---
 
+## 2026-04-09 — Dennis running carts on new games
+
+Dennis confirmed cart readiness and is now running brain carts on new ARC-AGI-3 games. Fleet has 7 games fully solved (up from 5 yesterday): ft09 217%, cd82 107%, sb26 109%, sc25 126%, tn36 210%, vc33 184%, lp85 361%.
+
+Andy & Claude sent the migration command (`python federate.py migrate shared-context/arc-agi-3/fleet-learning --in-place`) and offered a curated game insights cart option. Dennis's response:
+
+> "running with carts, let's see what difference it makes in new games. will take a while. it's a process :)"
+
+No questions, no blockers — just executing. Awaiting results on whether semantic cart retrieval improves solver performance on unsolved games.
+
+---
+
 ## 2026-04-08 — Federate Phase 1 merged + preserve mode + scope_mode polish
 
 ### What landed today (PR #11 on project-you-apps/membot)
