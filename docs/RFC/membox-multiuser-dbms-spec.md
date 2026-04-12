@@ -327,3 +327,48 @@ Phases 1-2 of the original Membox spec (Locking + Tagging, Version Chains + Disp
 *"How many DBMS products are targeted to both human consumers and agents from the start? Zero. We'd be the first." — Andy Grossberg, 2026-04-01*
 
 *"And how many neuromorphic DBMS products of any kind exist? Also zero. We'd be the first to that, too." — Andy Grossberg, 2026-04-07*
+
+---
+
+## Amendment 2 — Phase 1 SHIPPED (2026-04-08)
+
+Membox Phase 1 (locking + tagging) is **shipped and validated**. Implementation spec at [`membox-phase1-implementation.md`](membox-phase1-implementation.md). Code at `membot/membox.py` and adjacent additions to `membot/multi_cart.py` (`imprint_with_meta`, `_persist_cart`). 9 new MCP tools (`membox_*`). 11-test validation in `tests/test_membox.py` — all green on first run.
+
+What landed:
+
+- **CartLock class** in `membox.py` — per-cart write mutex with lease-based crash recovery (default 30s lease). Holder tracking by `agent_id`. Reads never touch the lock.
+- **`imprint(cart_id, text, agent_id, ...)`** — convenience API that acquires the lock, writes the pattern with full per-agent metadata (`agent_id`, `written_at`, `origin`, `tags`, `reasoning`), releases. Returns `local_addr` and metadata snapshot.
+- **`search(cart_id, query)`** — read API that delegates to `multi_cart.search()` and enriches each result with the per-pattern Membox metadata so consumers can see who wrote what.
+- **`status(cart_id)`** — diagnostic with lock state, write count per agent, recent write log (ring buffer).
+- **`mount` / `unmount` / `list_mounts`** — parallel to multi_cart's API, registers a CartLock per cart.
+- **Adjacent change**: `multi_cart.imprint_with_meta(cart_id, text, per_pattern_meta)` is the general-purpose write API used by Membox (and future things). It embeds the new text, appends to the in-memory state, and persists the cart with all fields preserved (hippocampus, pattern0, version, etc.). `_persist_cart()` is the helper that handles the on-disk write + manifest update.
+
+Test results (all 11 pass on first run):
+
+- mount/unmount/list — Membox carts visible with lock state
+- single-agent imprint — happy path, returns local_addr
+- lock holder query — None when idle, agent_id when held, None after release
+- lock timeout under contention — bob blocks for ~205ms when alice holds (timeout_ms=200)
+- invalid release raises PermissionError (bob can't release alice's lock)
+- read never blocks during write — search succeeds in 28ms while alice holds the write lock
+- two-agent concurrent imprint — both succeed via Python threads, unique local_addrs, serialized
+- agent_id stamping survives in per_pattern_meta — search results show `membox_meta.agent_id` matching the writer
+- status reports — `writes_by_agent: {alice: 2, bob: 1}` after the test sequence
+- lease-based crash recovery — alice "crashes" with lease=1s, bob acquires after ~1.2s wait
+
+Performance on the test cart (RTX 4080 Super local):
+
+- First imprint: 2,131ms (Nomic cold load)
+- Subsequent imprints: ~19ms (warm cache + append + persist)
+- Read while write lock held: 28ms (zero blocking)
+- Sustainable ~50 writes/second per agent under contention
+
+This is enough for the demo path described in the parent spec — two textareas, two agents, real concurrent writes, real attribution, real lock indicator. Phase 2 (version chains + dispute detection) builds on this same substrate without changing the wire protocol.
+
+The three-mode framework is now fully realized in Phase 1 form:
+
+- ✅ **Single-user** (legacy Membot, untouched)
+- ✅ **Federated** (Phase 1 shipped 2026-04-08, production-validated by dp-web4 fleet)
+- ✅ **Multiuser / Membox** (Phase 1 shipped 2026-04-08, 11/11 tests pass)
+
+All three share the multi-cart query layer as their substrate. None of them require changes to the cart format. Existing carts work in any mode.

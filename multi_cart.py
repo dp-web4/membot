@@ -612,3 +612,208 @@ def unmount_all() -> int:
     for cart_id in list(_mounted_carts.keys()):
         unmount(cart_id)
     return count
+
+
+# =============================================================================
+# IMPRINT — single-pattern write into a mounted cart
+# =============================================================================
+# This is the general-purpose write API used by Membox (membox.imprint())
+# and any other layer that needs to add a single pattern to a mounted cart
+# at runtime. It updates the in-memory state AND persists to disk.
+
+def imprint_with_meta(cart_id: str, text: str,
+                      per_pattern_meta: Optional[dict] = None) -> dict:
+    """Imprint a single new pattern into an already-mounted cart.
+
+    Embeds the text via the existing embedding pipeline, appends it to the
+    cart's embeddings/texts/binary_corpus arrays in-memory, appends the
+    per_pattern_meta entry, and persists the updated cart to disk.
+
+    Args:
+        cart_id: The cart to write to (must be mounted)
+        text: Pattern text content
+        per_pattern_meta: Optional dict of per-pattern metadata fields
+            (agent_id, written_at, tags, reasoning, etc.)
+
+    Returns:
+        dict with keys: cart_id, local_addr (the new pattern's index),
+        n_patterns (cart total after the write), elapsed_ms
+
+    Raises:
+        ValueError if cart_id is not mounted or text is empty
+    """
+    import json
+    import os
+    import zlib
+    import hashlib
+    from membot_server import embed_text
+
+    if cart_id not in _mounted_carts:
+        raise ValueError(f"Cart {cart_id!r} is not mounted")
+    if not text or not text.strip():
+        raise ValueError("text cannot be empty")
+
+    state = _mounted_carts[cart_id]
+    t0 = time.time()
+
+    # 1. Embed the new text
+    new_embedding = embed_text(text, prefix="search_document")
+    # Ensure float32 shape (1, 768)
+    new_embedding = np.asarray(new_embedding, dtype=np.float32)
+    if new_embedding.ndim == 1:
+        new_embedding = new_embedding.reshape(1, -1)
+
+    # 2. Append to in-memory embeddings
+    if state["embeddings"] is not None and len(state["embeddings"]) > 0:
+        state["embeddings"] = np.vstack([state["embeddings"], new_embedding]).astype(np.float32)
+    else:
+        state["embeddings"] = new_embedding.astype(np.float32)
+
+    # 3. Append to in-memory texts list
+    state["texts"].append(text)
+    new_local_addr = len(state["texts"]) - 1
+    state["n_patterns"] = len(state["texts"])
+    state["embedding_dim"] = state["embeddings"].shape[1]
+    state["has_embeddings"] = True
+
+    # 4. Update binary corpus (sign-zero bits) — append the new pattern's bits
+    new_sign = (new_embedding > 0).astype(np.uint8)
+    if state["binary_corpus"] is not None and len(state["binary_corpus"]) > 0:
+        if state["binary_corpus"].shape[1] <= 96:
+            # Already packed — pack the new bits and append
+            new_packed = np.packbits(new_sign, axis=1)
+            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_packed]).astype(np.uint8)
+        else:
+            # Unpacked format — append unpacked bits
+            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_sign]).astype(np.uint8)
+    else:
+        # First pattern — pack by default for storage efficiency
+        state["binary_corpus"] = np.packbits(new_sign, axis=1).astype(np.uint8)
+
+    # 5. Persist to disk — re-save the cart with the new pattern.
+    #    We use the same on-disk format the cart was loaded from.
+    _persist_cart(state, per_pattern_meta_addition=per_pattern_meta)
+
+    elapsed_ms = (time.time() - t0) * 1000
+    log.info(
+        f"[multi_cart] imprint_with_meta: cart={cart_id} local_addr={new_local_addr} "
+        f"n_patterns={state['n_patterns']} elapsed_ms={elapsed_ms:.0f}"
+    )
+
+    return {
+        "cart_id": cart_id,
+        "local_addr": new_local_addr,
+        "n_patterns": state["n_patterns"],
+        "elapsed_ms": round(elapsed_ms, 1),
+    }
+
+
+def _persist_cart(state: dict, per_pattern_meta_addition: Optional[dict] = None) -> None:
+    """Re-save a mounted cart to disk after an in-memory mutation.
+
+    Reads the existing on-disk cart to preserve fields we don't track in memory
+    (hippocampus, pattern0, version), updates the embeddings + passages +
+    sign_bits + per_pattern_meta from the current state, and writes back.
+
+    For per_pattern_meta: appends the new entry to whatever was already there.
+    Maintains the JSON-string-in-0d-ndarray format used by Cart Builder.
+    """
+    import json
+    import os
+    import zlib
+    import hashlib
+
+    cart_path = state["cart_path"]
+    if not cart_path or not os.path.exists(cart_path):
+        log.warning(
+            f"[multi_cart] _persist_cart: cart_path missing or doesn't exist for "
+            f"{state.get('cart_id')}; cannot persist"
+        )
+        return
+
+    # 1. Load the existing on-disk cart so we can preserve fields we don't have in memory
+    existing = np.load(cart_path, allow_pickle=True)
+    existing_keys = set(existing.files)
+
+    save_kwargs: dict = {}
+
+    # embeddings — from in-memory state (just got appended to)
+    save_kwargs["embeddings"] = state["embeddings"]
+
+    # passages — from in-memory state
+    save_kwargs["passages"] = np.array(state["texts"], dtype=object)
+
+    # compressed_texts — recompute from the current texts
+    compressed = []
+    for t in state["texts"]:
+        compressed.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
+    save_kwargs["compressed_texts"] = np.array(compressed, dtype=object)
+
+    # sign_bits — recompute from the current embeddings
+    save_kwargs["sign_bits"] = np.packbits(
+        (state["embeddings"] > 0).astype(np.uint8), axis=1
+    )
+
+    # hippocampus — preserve from existing cart if present (we don't update
+    # hippocampus on imprint in Phase 1; that's a Phase 2 enhancement)
+    if "hippocampus" in existing_keys:
+        # Note: this leaves the new pattern without a hippocampus entry, which
+        # is fine for Phase 1 — it just won't appear in episodic navigation.
+        # Phase 2 will add hippocampus entries on imprint.
+        save_kwargs["hippocampus"] = existing["hippocampus"]
+
+    # pattern0 — preserve as-is
+    if "pattern0" in existing_keys:
+        save_kwargs["pattern0"] = existing["pattern0"]
+
+    # version — preserve as-is
+    if "version" in existing_keys:
+        save_kwargs["version"] = existing["version"]
+
+    # per_pattern_meta — load existing, append the new entry, re-encode
+    existing_meta_list: list = []
+    if "per_pattern_meta" in existing_keys:
+        try:
+            raw = existing["per_pattern_meta"]
+            s = raw.item() if raw.ndim == 0 else str(raw)
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                existing_meta_list = parsed
+        except Exception as e:
+            log.warning(f"[multi_cart] _persist_cart: could not parse existing per_pattern_meta: {e}")
+            existing_meta_list = []
+
+    # Pad existing meta list with empty dicts if it's shorter than the texts
+    # (this handles the case where the cart has more patterns than meta entries)
+    while len(existing_meta_list) < len(state["texts"]) - 1:
+        existing_meta_list.append({})
+
+    # Append the new entry (or empty dict if no addition was specified)
+    new_entry = per_pattern_meta_addition if per_pattern_meta_addition is not None else {}
+    existing_meta_list.append(new_entry)
+
+    # Re-encode as JSON string in a 0-d object array (matches the Cart Builder format)
+    save_kwargs["per_pattern_meta"] = np.array(json.dumps(existing_meta_list), dtype=object)
+
+    # 2. Atomically write the updated cart
+    np.savez_compressed(cart_path, **save_kwargs)
+
+    # 3. Rewrite the manifest with the new fingerprint and count
+    h = hashlib.sha256()
+    if len(state["embeddings"]) > 0:
+        h.update(state["embeddings"][0].tobytes())
+        h.update(state["embeddings"][-1].tobytes())
+    h.update(str(len(state["texts"])).encode())
+    fingerprint = h.hexdigest()[:16]
+
+    manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
+    manifest = {
+        "version": "mcp-v4",
+        "count": len(state["texts"]),
+        "has_hippocampus": "hippocampus" in existing_keys,
+        "fingerprint": fingerprint,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rebuilt_by": "multi_cart.imprint_with_meta",
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
