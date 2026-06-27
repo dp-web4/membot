@@ -2218,6 +2218,13 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if n_current >= MAX_ENTRIES:
         return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
+    # Exact-dedup: refuse byte-identical re-stores. Clients (e.g. snarc's bridge)
+    # re-emit recurring patterns every session; storing the same entry twice only
+    # bloats the cartridge and pollutes recall. No-op skip, not an error.
+    stored_text = f"[{tags}] {content}" if tags else content
+    if state["texts"] and stored_text in state["texts"]:
+        return f"Duplicate — already stored, skipped: \"{content[:60]}\""
+
     log.info(f"memory_store('{content[:60]}...')")
 
     try:
