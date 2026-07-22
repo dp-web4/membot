@@ -86,6 +86,10 @@ CARTRIDGE_DIRS = [
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "webgpu", "cartridges"),
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "cartridges"),
     os.path.join(BASE_DIR, "..", "vector-benchmark-demo", "cuda", "self_contained_cart_test"),
+    # Fleet-wide shared cartridges (HUB fleet-memory-maintainer output). membot/ and
+    # shared-context/ are siblings fleet-wide, so mount_cartridge("fleet-memory") resolves
+    # by bare name on every instance. See shared-context/fleet-memory/README.md.
+    os.path.join(BASE_DIR, "..", "shared-context", "fleet-memory"),
 ]
 # Mempack storage: per-user writable carts at cartridges/users/<owner_id>/<name>.cart.npz.
 # Walked recursively by find_mempacks() (separate from find_cartridges which only does
