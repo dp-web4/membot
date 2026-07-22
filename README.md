@@ -214,6 +214,147 @@ mcporter call membot.memory_search query="your query" top_k=5
 
 See [SOUL-research-bot-merged.md](SOUL-research-bot-merged.md) for a working example.
 
+## What's New (June 2026)
+
+### `walk_associate` -- substrate-walk MCP tool
+
+Membot now exposes **`walk_associate`** as a first-class MCP tool. Unlike `memory_search` which returns the top-K direct semantic matches, `walk_associate` additionally re-queries the substrate from each primary result's own embedding and surfaces items that appeared in multiple of those silent re-queries -- *"you may have missed"* associations the substrate found by walking outward from the seed.
+
+```python
+walk_associate(
+    query: str,
+    top_k: int = 10,              # primary results returned
+    walk_top_k: int = 0,          # per-primary walk-hop breadth (0 = auto = max(top_k*3, 20))
+    walk_min_hits: int = 2,       # min walks-to count to promote item to "may have missed"
+    walk_max_show: int = 10,      # max "may have missed" items returned
+    temperature: float = 0.0,     # 0.0 = deterministic; 0.3-0.5 = moderate serendipity; 0.7+ = high exploration
+    session_id: str = "",
+) -> str
+```
+
+**When to use `walk_associate` vs `memory_search`:**
+
+- **`memory_search`** -- direct factual lookup ("what did the user say about X?"). Returns ranked top-K. Use when the query maps to one cluster of closely-related passages and you want the obvious matches.
+- **`walk_associate`** -- exploratory discovery ("what's adjacent to X?", "who else cares about Y?", "find me collaborators around Z"). Returns direct matches PLUS items the substrate's walk discovered through associative re-querying. Use when adjacency matters as much as direct match -- member discovery, brainstorming, cross-cluster connection-finding.
+
+**The `temperature` knob**: controls how exploratory the walk is. Temperature 0.0 is deterministic -- walks each primary item's direct neighborhood. Temperature 0.3-0.5 perturbs walk-hop queries with controlled noise (basin escape) so the walk can hop to adjacent semantic neighborhoods. Temperature 0.7+ is high-exploration / brainstorming mode. Same query, different temperatures, different discovery modes.
+
+**Worked example** (gutenberg-poetry cart, 60k passages):
+
+```text
+walk_associate("love and loss", top_k=10, walk_min_hits=2, temperature=0.0)
+  -> 10 primary matches (Shakespeare sonnets, Keats elegies, etc.)
+  -> 3 "may have missed" Christina Rossetti poems -- Rossetti is famous for love-and-loss
+    work but didn't make the direct top-10; surfaced via walk-hop because multiple
+    primary items' nearest neighborhoods independently pointed at her poetry.
+
+walk_associate("love and loss", top_k=10, temperature=0.4)
+  -> Same 10 primary; missed set includes Rossetti's "Sweet Death" -- death-themed work
+    surfacing in a love-and-loss query because temperature broadened the walk into
+    adjacent themes.
+```
+
+**Calling from your own code:** [`tools/walk_associate_client_example.py`](tools/walk_associate_client_example.py) is a self-contained Python script that mounts a cart, calls `walk_associate` via MCP, and parses the response into a structured `{primary: [...], missed: [...]}` dict. Uses only `requests` (no FastMCP package needed on the client side), so the wire-level JSON-RPC protocol is visible and portable to any language. Run with defaults to hit the live droplet (`https://project-you.app/membot/mcp`) on gutenberg-poetry with "love and loss"; flags let you swap cart, query, or temperature.
+
+The architectural framing: Walk gives every LLM that mounts Membot a *tunable cognitive primitive* on top of standard retrieval. **Attention budget** = `top_k` x `walk_top_k` (how deeply the walk explores). **Goal-orientation** = `temperature` + query (where it points and how exploratory). The bridge from "external memory for LLMs" to "cognition substrate for LLMs."
+
+Mempack agents (`mempack_local_agent.py` SYSTEM_PROMPT_TEMPLATE) gained CORE BEHAVIOR #10 instructing the LLM to choose between `memory_search` and `walk_associate` based on task intent -- direct lookup vs exploratory discovery.
+
+**Roadmap (future enhancements):**
+
+- `seed_idx: int` -- when walking from a known passage index (e.g., agent clicks a result to "continue the walk"), skip text re-embedding and walk straight from the cached embedding. Pure speed win; no semantic change because sentence-transformers inference is deterministic in eval mode (no dropout, no sampling -- re-embedding the same text returns bitwise-identical vectors).
+- `walk_from: str` mode flag -- choose `"results"` (default, current: 2-hop consensus from primary results -- "what's central to my hits") vs `"seed"` (stochastic sampling of the query's own neighborhood with temperature -- "what else is near my query that just missed the top-K"). Different semantics, both useful; the consensus mode is what's load-bearing for associative-discovery v1.
+- `return_trail: bool` -- surface the actual walk path (which primary led to which neighbor) for explainability. Useful for "we surfaced X because primary item Y walked there."
+
+### Reader prompt library + dual-mode Mempack synthesis
+
+Two additions to the reader/answer-synthesis side of the stack, driven by LongMemEval architectural diagnostics that surfaced (1) a question-type taxonomy where preference/recommendation questions need fundamentally different reader posture than factual recall, and (2) a temporal-anchoring gap where relative time references in memory need an absolute date anchor to be resolvable.
+
+**[`prompts.py`](prompts.py) — explicit prompt template library.** Four named variants any client can import:
+
+```python
+from membot.prompts import RECOMMENDED_DEFAULT, READER_PROMPTS
+
+# Use the recommended dual-mode template (handles factual recall AND recommendation)
+prompt = RECOMMENDED_DEFAULT.format(context=retrieved_text, question=user_q)
+
+# Or pick a specific variant by name
+prompt = READER_PROMPTS["minimal"].format(...)
+```
+
+| Variant | Best for |
+|---|---|
+| `restrictive` | qwen-14b-class small-tier readers (legacy default) |
+| `permissive` | same long structure with deduction rules relaxed |
+| `minimal` | Sonnet/Opus single-mode factual recall |
+| `general` | Sonnet/Opus dual-mode — handles factual AND recommendation/preference questions correctly. This is `RECOMMENDED_DEFAULT`. |
+
+Membot itself does NOT apply these prompts — it's a retrieval substrate. The library publishes recommended templates for clients (benchmark runners, batch pipelines, custom agentic readers) that need a deterministic single-shot reader prompt.
+
+**Mempack agent gets the framing inline.** The local agent's [`SYSTEM_PROMPT_TEMPLATE`](tools/mempack_local_agent.py) now includes two new CORE BEHAVIORS:
+
+- **#8 — Dual-mode answering**: factual recall (answer from retrieval) vs recommendation/preference/advice (derive preferences from retrieval, then commit to a novel recommendation aligned with them). Closes the same gap LongMemEval revealed: capable readers under "answer from memory only" framing refuse recommendation queries even when they cleanly identified the relevant preferences.
+- **#9 — Temporal anchoring**: use the timestamp field already in the template as the anchor for resolving relative time references ("yesterday", "last week") to absolute dates. Prefer session-date metadata from retrieved passages when present.
+
+Net effect: a typical Mempack agent now handles both factual ("what did I say about X") and recommendation ("what should I get given what you know about me") queries correctly without per-cart Pattern I customization, and is ready to consume server-side temporal metadata projection when it ships.
+
+---
+
+## What's New (May 2026)
+
+### Mempack — Per-Agent Writable Brain Cartridges
+
+A **Mempack** is a Membot cartridge an agent owns and writes to. Same lattice substrate as a knowledge cart, with three reserved slots that turn a static document into a living memory: a manifest at **Pattern 0**, behavioral instructions at **Pattern I** (idx=1), and accumulated learnings at **Pattern N+** (idx≥2). When the agent mounts its Mempack, the briefing and behavior load automatically. No prompt-stuffing, no per-session re-briefing. The cart bootstraps the agent.
+
+|Slot|Purpose|Default state|
+|---|---|---|
+|Pattern 0|Cart manifest: ownership, perms, cart_type, briefing|pinned + archival, read-only|
+|Pattern I (idx=1)|Agent's behavioral instructions, voice, persona, operating rules|pinned + archival, owner-writable|
+|Pattern N+ (idx≥2)|Accumulated findings, decisions, source links, search hits|volatile (decay-eligible), owner-writable|
+
+#### Two-Layer Persistence
+
+Mempacks split across Supabase rather than living on the Membot host's filesystem. Each user owns their data; the Membot droplet doesn't keep personal carts on disk.
+
+- **Postgres metadata** in `public.mempacks` (one row per cart) plus `public.mempack_patterns` (one row per pattern, with the 64-byte H-block exploded into native columns + 9 generated boolean/enum columns for SQL-side querying without unblobbing the cart).
+- **Binary blob** in Supabase Storage at `mempacks/<user_uuid>/<name>.cart.npz`. RLS scopes each user to their own folder; Membot uses a service-role key to read/write on the agent's behalf at mount time.
+
+Cross-Mempack search becomes a SQL JOIN over normalized H-block columns rather than fetch-all-blobs-then-filter. Free tier: 1 Mempack of 10 MB per user; Pro and Enterprise tiers tune via insert-trigger policy.
+
+#### MCP-Native Access
+
+A Mempack travels. Mount it from Claude Code today, Cursor tomorrow, a custom OpenClaw agent next week. The cart format is one file; the access protocol is MCP; provenance carries through every host.
+
+```python
+# Auto-provision on first list (Path C): empty roster -> starter primary
+GET /api/mempacks?owner_id=<supabase-uuid>
+# -> {"status": "ok", "count": 1, "auto_provisioned": true, "mempacks": [...]}
+
+# Read Pattern I via the MCP tool
+mempack_read_pattern_i(name="primary")
+# -> the agent's own behavioral instructions, fresh from Supabase
+
+# Mount and search like any cart
+mount_cartridge("primary")
+memory_search("attention mechanisms", top_k=5)
+```
+
+See [`docs/AGENT_INSTRUCTIONS.md`](docs/AGENT_INSTRUCTIONS.md) for the three access patterns (MCP / mcporter / REST) and [`docs/mcp.json.example`](docs/mcp.json.example) for a copy-paste MCP host config.
+
+#### Path C Lazy Auto-Provision
+
+The first time a user calls `GET /api/mempacks?owner_id=<uuid>` with no existing rows, Membot creates a starter `primary` Mempack: pinned + archival header, pinned + archival Pattern I with a default behavioral template, audit-log entry, status flipped to `ready` after the blob upload completes. Subsequent calls are idempotent. No signup-side trigger or service-key plumbing needed; the substrate primitive handles it directly.
+
+Set `auto_provision=false` on the query string to opt out (returns empty list without creating).
+
+#### Canonical 12-Field H-Block Format
+
+This release unifies the cart-format hippocampus on the canonical 12-field `HIPPO_FORMAT` (`<I B B I I I I H I B B 34s`, with `perms_byte` at offset 29). Legacy 11-field carts are still readable via the `format_version` discriminator at offset 4. New writes always emit canonical.
+
+The H-block (cart-format hippocampus, 64-byte struct per pattern) is distinct from the lattice-encoded H-row (64-bit physics-layer header on row 63). Two layers, two consumers: H-block for cart-format navigation + perms; H-row for F0 physics recall.
+
+---
+
 ## What's New (April 2026)
 
 ### Multi-Cart Query — One Membot, Many Mounted Carts
@@ -376,22 +517,6 @@ Then access at `https://your-domain/membot/depot`.
    - Keyword reranking boosts results containing query terms
 3. **Store**--new text is embedded, added to the cartridge, and its binary code is appended to the Hamming index
 4. **Save**--cartridge persists as secure `.npz` with SHA256 integrity manifest
-
-### The Neuromorphic Substrate
-
-Patterns are stored on a neuromorphic lattice--a 64x64 grid of 64 regions (16 million neurons) with Hebbian weights, Mexican hat inhibition, and energy dynamics. The lattice provides **content-addressable recall**: present a partial or noisy cue, and the attractor dynamics converge to the correct stored pattern. This is Hopfield network behavior, validated at 1 million Wikipedia embeddings with R@1=1.000 under clean, erasure, and bitflip conditions--no capacity wall found.
-
-Search uses the compact binary index (fast, no GPU). Recall uses the full lattice physics (noise-tolerant, associative). One substrate, two access modes.
-
-### Cross-Modal Association
-
-The lattice natively supports **multimodal associative recall**. Embed two different signals (e.g., image via CLIP, audio via CLAP), project them into a shared 768-dim vector, and train the lattice. The Hebbian weights encode the cross-modal association:
-
-- **Show it a picture → hear the sound.** Image cue → audio recalled (cosine 0.9998).
-- **Play a sound → see the picture.** Audio cue → image recalled (cosine 0.9969).
-- **Corrupt the input → clean recall.** 50% noise → denoised (cosine 0.9945).
-
-Three training passes. One pattern. No separate cross-modal model. The physics learns the binding between modalities through the same Hebbian mechanism that stores text. Any signal that can be embedded into a dense vector can participate in associative recall--text, vision, audio, or any combination.
 
 ## Brain Cartridges
 
@@ -620,13 +745,10 @@ bash start-tui.sh
 | **LLM dependency** | None. Search, store, and recall are LLM-free. | Every operation requires LLM calls (fact extraction, relationship building, compaction). |
 | **Storage model** | Portable brain cartridges--files you own and carry. | Cloud APIs, vendor lock-in, subscription pricing. |
 | **Search** | SimHash Hamming + keywords. Binary math, no neural inference. | Embedding cosine via API. Scales with token cost. |
-| **Association** | Hebbian attractor dynamics discover non-obvious connections. | Keyword/embedding overlap only. |
 | **Scale** | 4.8M entries on a $12/mo server. | Priced per query, per GB, per seat. |
-| **Physics** | Trained Hebbian weights, content-addressable recall, noise tolerance. | None. |
-| **Cross-modal** | Show a picture → hear the sound. Hebbian association, no separate model. | Not supported. |
 | **Energy** | Train once, query forever. No LLM calls in the pipeline. | Every ingest and query requires LLM inference. |
 
-The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. Membot's innovation is combining SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
+The sign-zero binary encoding used by Membot is a form of [SimHash (Charikar, 2002)](https://dl.acm.org/doi/10.1145/509907.509965)--a well-established locality-sensitive hashing technique. The cartridges Membot serves are built by [Vector+ Studio](https://github.com/project-you-apps/vector-plus-studio), which combines SimHash with Hebbian settle dynamics: patterns are trained through a neuromorphic physics pipeline before their binary signatures are captured. The resulting signatures encode associative relationships not present in the original embedding geometry.
 
 ## Security
 

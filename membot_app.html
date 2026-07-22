@@ -81,6 +81,15 @@
   .brand-text h1 span { color: var(--accent); }
   .brand-text p { font-size: 12px; color: var(--text-dim); margin-top: -2px; }
 
+  /* ---- Intro tagline ---- */
+  .intro {
+    font-size: 13px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    margin: -8px 0 18px;
+  }
+  .intro strong { color: var(--text); font-weight: 600; }
+
   /* ---- Theme toggle ---- */
   .theme-toggle {
     background: var(--surface);
@@ -255,6 +264,37 @@
   .result-footer .tag {
     background: var(--surface-2); padding: 1px 6px; border-radius: 3px;
   }
+  .result-footer .prov {
+    margin-left: auto; font-size: 10px; opacity: 0.7;
+    font-style: italic;
+  }
+  .result-text a, .passage-text a {
+    color: var(--accent); text-decoration: none;
+    border-bottom: 1px dotted var(--accent);
+  }
+  .result-text a:hover, .passage-text a:hover {
+    text-decoration: none; border-bottom-style: solid;
+  }
+  .passage-modal-source {
+    padding: 8px 20px; border-top: 1px solid var(--border);
+    font-size: 11px; color: var(--text-dim); font-family: var(--mono);
+    flex-shrink: 0;
+  }
+  .passage-modal-cta {
+    padding: 12px 20px; border-top: 1px solid var(--border);
+    text-align: center; flex-shrink: 0;
+  }
+  .modal-cta-btn {
+    background: var(--accent); color: white; border: none;
+    padding: 10px 18px; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600; font-family: var(--sans);
+    transition: background 0.2s;
+  }
+  .modal-cta-btn:hover { background: var(--accent-dim); }
+  .modal-cta-btn:disabled { opacity: 0.6; cursor: wait; }
+  .modal-cta-loading {
+    font-size: 12px; color: var(--text-dim); font-style: italic;
+  }
   .result-card { cursor: pointer; }
   .passage-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:900; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.2s; pointer-events:none; }
   .passage-overlay.open { opacity:1; pointer-events:auto; }
@@ -405,6 +445,12 @@
     </div>
   </div>
 
+  <!-- Intro -->
+  <p class="intro">
+    <strong>Self-contained semantic search without the LLM.</strong>
+    Click a cart to mount it, then search with plain English &mdash; no generation, no hallucinations.
+  </p>
+
   <!-- Cartridge Bar -->
   <div class="cart-bar" id="cartBar">
     <div class="cart-chip" onclick="listCarts()">
@@ -443,6 +489,8 @@
         <button class="modal-close" onclick="closePassage()" title="Close">&#x2715;</button>
       </div>
       <div class="passage-modal-body"><div class="passage-text" id="modalText"></div></div>
+      <div class="passage-modal-cta" id="modalCta" style="display:none"></div>
+      <div class="passage-modal-source" id="modalSource" style="display:none"></div>
       <div class="passage-modal-footer">
         <button class="passage-nav-btn" id="btnPrev" title="Previous chunk (when metadata wired)">&#x25C0; Prev</button>
         <button class="passage-nav-btn" id="btnNext" title="Next chunk (when metadata wired)">Next &#x25B6;</button>
@@ -613,6 +661,8 @@ async function doSearch() {
     }
     _lastResults = items || [];
 
+    const haystack = _memories ? ` of ${_memories.toLocaleString()}` : '';
+
     if (!items || items.length === 0) {
       el.innerHTML = `
         <div class="empty-state">
@@ -620,11 +670,11 @@ async function doSearch() {
           <p>No results found</p>
           <div class="hint">Try a different query or broader terms</div>
         </div>`;
-      meta.textContent = `0 results in ${elapsed}ms`;
+      meta.textContent = `0 results${haystack} in ${elapsed}ms`;
       return;
     }
 
-    meta.textContent = `${items.length} results in ${elapsed}ms`;
+    meta.textContent = `${items.length}${haystack} results in ${elapsed}ms`;
 
     el.innerHTML = items.map((item, i) => {
       const text = esc(item.text || item.content || '');
@@ -632,6 +682,11 @@ async function doSearch() {
       const tags = item.tags ? item.tags.split(',').map(t =>
         `<span class="tag">${esc(t.trim())}</span>`
       ).join('') : '';
+      // Provenance footer: source DB + paper_id when split-cart returns them.
+      const provBits = [];
+      if (item.source_db) provBits.push(esc(item.source_db));
+      if (item.paper_id)  provBits.push('id: ' + esc(item.paper_id));
+      const prov = provBits.length ? `<span class="prov">${provBits.join(' · ')}</span>` : '';
 
       return `
         <div class="result-card" data-idx="${i}">
@@ -639,8 +694,8 @@ async function doSearch() {
             <span class="result-rank">#${i + 1}</span>
             ${score ? `<span class="result-score">score: ${score}</span>` : ''}
           </div>
-          <div class="result-text">${highlight(text, query)}</div>
-          ${tags ? `<div class="result-footer">${tags}</div>` : ''}
+          <div class="result-text">${highlight(linkify(text), query)}</div>
+          ${(tags || prov) ? `<div class="result-footer">${tags}${prov}</div>` : ''}
         </div>`;
     }).join('');
 
@@ -666,6 +721,8 @@ function openPassage(resultIdx) {
     next_idx: item.next_idx,
     score: item.score,
     rank: resultIdx + 1,
+    paper_id: item.paper_id,
+    source_db: item.source_db,
   });
 }
 
@@ -673,7 +730,34 @@ function _showPassage(p) {
   _currentPassage = p;
   $('#modalRank').textContent = p.rank ? '#' + p.rank : 'idx:' + p.index;
   $('#modalScore').textContent = p.score != null ? 'score: ' + p.score.toFixed(4) : '';
-  $('#modalText').innerHTML = highlight(esc(p.full_text), _lastQuery);
+  $('#modalText').innerHTML = highlight(linkify(esc(p.full_text)), _lastQuery);
+
+  // State machine: split-cart preview (source_db, no paper_id) shows the load CTA;
+  // loaded state (paper_id present) shows the source line. Non-split carts (no
+  // source_db) show neither — modal body is the entire content.
+  const isSplit = !!p.source_db;
+  const isLoaded = !!p.paper_id;
+  const cta = $('#modalCta');
+  const src = $('#modalSource');
+  if (cta) {
+    if (isSplit && !isLoaded) {
+      cta.innerHTML = '<button class="modal-cta-btn" onclick="loadSource()">&#x1F4C2; Load full passage from ' + esc(p.source_db) + ' &rarr;</button>';
+      cta.style.display = 'block';
+    } else {
+      cta.style.display = 'none';
+      cta.innerHTML = '';
+    }
+  }
+  if (src) {
+    if (isLoaded) {
+      const bits = ['source: ' + p.source_db];
+      if (p.paper_id) bits.push('id: ' + p.paper_id);
+      src.textContent = bits.join(' · ');
+      src.style.display = 'block';
+    } else {
+      src.style.display = 'none';
+    }
+  }
 
   // Wire PREV/NEXT buttons
   const btnP = $('#btnPrev'), btnN = $('#btnNext');
@@ -696,6 +780,32 @@ function _showPassage(p) {
   document.addEventListener('keydown', _passageKeys);
 }
 
+async function loadSource() {
+  if (!_currentPassage) return;
+  const cta = $('#modalCta');
+  const idx = _currentPassage.index;
+  if (cta) cta.innerHTML = '<span class="modal-cta-loading">Loading from source database&hellip;</span>';
+  try {
+    const r = await fetch(BASE() + '/api/passage?idx=' + idx);
+    const data = await r.json();
+    if (data.error) { toast(data.error, 'error'); return; }
+    const p = data.passage;
+    _showPassage({
+      index: p.index,
+      full_text: p.full_text,
+      prev_idx: p.prev_idx,
+      next_idx: p.next_idx,
+      score: _currentPassage.score,
+      rank: _currentPassage.rank,
+      source_db: p.source_db,
+      paper_id: p.paper_id,
+    });
+  } catch(e) {
+    toast('Source load failed: ' + e.message, 'error');
+    if (cta) cta.innerHTML = '<button class="modal-cta-btn" onclick="loadSource()">Retry</button>';
+  }
+}
+
 async function navigatePassage(idx) {
   try {
     const r = await fetch(BASE() + '/api/passage?idx=' + idx);
@@ -709,6 +819,8 @@ async function navigatePassage(idx) {
       next_idx: p.next_idx,
       score: null,
       rank: null,
+      source_db: p.source_db,
+      paper_id: p.paper_id,
     });
   } catch(e) {
     toast('Navigation failed: ' + e.message, 'error');
@@ -763,15 +875,26 @@ function esc(s) {
 }
 
 const _STOP = new Set(['the','and','are','was','were','for','that','this','with','from','not','but','has','had','have','does','did','will','can','its','who','what','how','why','about','tell','you','your','some','than','them','then','they','been','more','also','into','would','could','should','just','like','very','much','many','only','other','over','such','after','before','between','through','where','when','which','while','each','there','their','these','those','being','because','during','both','same','own','most','well','way','all','out','one','two','may']);
-function highlight(text, query) {
-  if (!query) return text;
+function highlight(html, query) {
+  if (!query) return html;
   const words = query.split(/\s+/).filter(w => w.length > 2 && !_STOP.has(w.toLowerCase()));
-  let result = text;
+  let result = html;
   for (const word of words) {
-    const re = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+    // Negative lookahead (?![^<]*>) prevents matches inside open tags / attribute
+    // values (e.g. inside href="https://arxiv.org"). Match in visible text only.
+    const re = new RegExp(`(${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})(?![^<]*>)`, 'gi');
     result = result.replace(re, '<mark>$1</mark>');
   }
   return result;
+}
+
+function linkify(escapedText) {
+  // Wrap http(s) URLs in clickable links. Input must already be HTML-escaped.
+  // Trailing punctuation (.,;:) is excluded from the link.
+  return escapedText.replace(
+    /(https?:\/\/[^\s<]+?)([.,;:!?)\]]?(?=\s|$|<))/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>$2'
+  );
 }
 
 function toast(msg, type = 'success') {

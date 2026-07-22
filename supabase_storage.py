@@ -1,0 +1,683 @@
+"""
+supabase_storage.py — Mempack persistence layer.
+
+Wraps supabase-py for Mempack CRUD against:
+
+- public.mempacks               row metadata (one row per cart)
+- public.mempack_patterns       per-pattern H-block, normalized columns + bytea
+- public.mempack_provisions_log audit trail for auto-provision events
+- Storage bucket 'mempacks'     the actual .cart.npz blobs
+
+Membot uses the service role key to bypass RLS — it acts on behalf of any
+user at mount/store time, scoped by owner_id passed in API calls. User-side
+JWTs are verified separately in the REST handler layer.
+
+Required env vars in /opt/membot/.env:
+  SUPABASE_URL                  e.g. https://uikdknfxcqklldmfshug.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY     JWT with service_role claim (from Supabase Studio)
+
+See docs/PATTERN-ANATOMY.md §3 for H-block field semantics, and
+vector-plus-studio-repo/db/002_mempacks_schema.sql for the table definitions
+this module reads/writes.
+
+Andy + Claude 2026-05-13.
+"""
+
+import base64
+import os
+import struct
+import warnings
+from typing import Optional
+
+# supabase-py 2.30+ emits DeprecationWarnings from inside its own client
+# construction about `timeout` and `verify` kwargs being moved to the http
+# client. We don't pass those kwargs ourselves — the library does it internally —
+# so we can't fix them from here. Suppress just those specific warnings
+# rather than letting them clutter every log line.
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"supabase\..*",
+)
+
+try:
+    from supabase import create_client, Client
+except ImportError as e:
+    raise ImportError(
+        "supabase-py not installed in this venv. "
+        "Run: /opt/membot/venv/bin/pip install supabase"
+    ) from e
+
+# H-block format constants live in cartridge_builder; re-import here so callers
+# can import everything Mempack-related from one place.
+from cartridge_builder import (  # noqa: F401 — re-exported for callers
+    HIPPO_FORMAT,
+    HIPPO_SIZE,
+    FLAG_TOMBSTONE, FLAG_PINNED, FLAG_HAS_PARENT, FLAG_HAS_CHILD, FLAG_HAS_SIBLING,
+    FLAG_PERISH_MASK, FLAG_PERISH_VOLATILE, FLAG_PERISH_REPLACEABLE, FLAG_PERISH_ARCHIVAL,
+    PERM_R, PERM_W, PERM_X, PERM_DEFAULT,
+    FORMAT_VERSION_CANONICAL,
+)
+
+
+BUCKET = "mempacks"
+
+
+# ---------------------------------------------------------------------------
+# Client init (lazy, singleton)
+# ---------------------------------------------------------------------------
+
+_client: Optional["Client"] = None
+
+
+def get_client() -> "Client":
+    """Lazy-init the supabase client. Reads creds from env on first call.
+
+    Raises RuntimeError if SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing —
+    a clear failure mode rather than a confusing client-init crash later.
+    """
+    global _client
+    if _client is None:
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+        if not url or not key:
+            raise RuntimeError(
+                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in env. "
+                "See /opt/membot/.env on the droplet. "
+                "Service role key comes from Supabase Studio -> Project Settings -> API."
+            )
+        _client = create_client(url, key)
+    return _client
+
+
+def reset_client() -> None:
+    """Drop the cached client (useful in tests, or after env changes)."""
+    global _client
+    _client = None
+
+
+# ---------------------------------------------------------------------------
+# Storage bucket ops — the .cart.npz blobs
+# ---------------------------------------------------------------------------
+
+def storage_path(owner_id: str, name: str) -> str:
+    """Construct the canonical storage path for a user's Mempack blob.
+
+    Maps to the bucket RLS policies: first path segment MUST equal auth.uid()
+    for the requesting user. Service role bypasses RLS so membot reads/writes
+    any owner's blob.
+    """
+    return f"{owner_id}/{name}.cart.npz"
+
+
+def upload_blob(owner_id: str, name: str, blob_bytes: bytes) -> None:
+    """Upload (or replace) a Mempack blob in Storage. Uses upsert so re-runs
+    are idempotent (cart-update overwrites the previous version).
+    """
+    sb = get_client()
+    path = storage_path(owner_id, name)
+    sb.storage.from_(BUCKET).upload(
+        path,
+        blob_bytes,
+        file_options={
+            "content-type": "application/octet-stream",
+            "upsert": "true",
+        },
+    )
+
+
+def download_blob(owner_id: str, name: str) -> bytes:
+    """Fetch a Mempack blob from Storage. Returns the raw .npz bytes."""
+    sb = get_client()
+    path = storage_path(owner_id, name)
+    return sb.storage.from_(BUCKET).download(path)
+
+
+def delete_blob(owner_id: str, name: str) -> None:
+    """Remove a Mempack blob from Storage."""
+    sb = get_client()
+    path = storage_path(owner_id, name)
+    sb.storage.from_(BUCKET).remove([path])
+
+
+# ---------------------------------------------------------------------------
+# Postgres ops on public.mempacks
+# ---------------------------------------------------------------------------
+
+def get_mempack_by_name(owner_id: str, name: str) -> Optional[dict]:
+    """Return the mempack row for (owner_id, name), or None if not present."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("*")
+        .eq("user_id", owner_id)
+        .eq("name", name)
+        .maybe_single()
+        .execute()
+    )
+    return res.data if res else None
+
+
+def list_mempacks(owner_id: str) -> list[dict]:
+    """Return all mempack rows for a user, oldest first."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("*")
+        .eq("user_id", owner_id)
+        .order("created_at")
+        .execute()
+    )
+    return res.data or []
+
+
+def insert_mempack(
+    owner_id: str,
+    name: str,
+    pattern_count: int,
+    size_bytes: int,
+    briefing: str = "",
+    pattern_i_text: str = "",
+    manifest: dict | None = None,
+    cart_type: str = "agent-memory",
+    status: str = "pending",
+) -> dict:
+    """Insert a new mempack row. Returns the inserted row (with id, created_at).
+
+    Atomicity model: row is inserted with storage_status='pending' before blob
+    upload, then updated to 'ready' after upload succeeds. Reconciliation cron
+    sweeps stale 'pending' rows older than N minutes.
+    """
+    sb = get_client()
+    row = {
+        "user_id": owner_id,
+        "name": name,
+        "cart_type": cart_type,
+        "storage_bucket": BUCKET,
+        "storage_path": storage_path(owner_id, name),
+        "storage_status": status,
+        "pattern_count": pattern_count,
+        "size_bytes": size_bytes,
+        "briefing": briefing,
+        "pattern_i_text": pattern_i_text,
+        "manifest": manifest or {},
+        "format_version": FORMAT_VERSION_CANONICAL,
+    }
+    res = sb.table("mempacks").insert(row).execute()
+    return res.data[0] if res.data else {}
+
+
+def mark_mempack_ready(mempack_id: str) -> None:
+    """Flip storage_status pending → ready after a successful blob upload."""
+    sb = get_client()
+    sb.table("mempacks").update({"storage_status": "ready"}).eq("id", mempack_id).execute()
+
+
+def touch_mempack_mount(mempack_id: str) -> None:
+    """Bump last_mounted_at + mount_count on a successful mount."""
+    sb = get_client()
+    sb.rpc("increment_mempack_mount", {"mempack_id": mempack_id}).execute()
+    # Note: increment_mempack_mount is a Postgres function we'll add in 003
+    # if we want atomic counter increments. For v1, naive update is fine:
+    # sb.table("mempacks").update({...}).eq("id", mempack_id).execute()
+
+
+def delete_mempack_row(mempack_id: str) -> None:
+    """Cascade-delete the mempack row. mempack_patterns rows go with it via FK."""
+    sb = get_client()
+    sb.table("mempacks").delete().eq("id", mempack_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# Postgres ops on public.mempack_patterns
+# ---------------------------------------------------------------------------
+
+def insert_pattern_rows(
+    mempack_id: str,
+    hippocampus_bytes: bytes,
+    texts: list[str],
+    start_idx: int = 0,
+) -> int:
+    """Explode an H-block byte array into rows of public.mempack_patterns.
+
+    Args:
+        mempack_id:        UUID of the parent mempack row
+        hippocampus_bytes: concatenated 64-byte H-blocks, N * HIPPO_SIZE bytes
+        texts:             parallel list of N pattern bodies (for text_preview + text_length)
+        start_idx:         pattern_idx for the FIRST H-block in the bytes array.
+                           Default 0 (full-cart insert from scratch). Pass N when
+                           appending one new pattern at the tail of an N-pattern cart.
+
+    Returns: number of pattern rows inserted.
+
+    Idempotency: caller should delete existing rows for this mempack_id first
+    if doing a full re-sync (cart update path). Insert-only here.
+    """
+    sb = get_client()
+    n_patterns = len(hippocampus_bytes) // HIPPO_SIZE
+    if n_patterns == 0:
+        return 0
+
+    rows = []
+    for i in range(n_patterns):
+        chunk = hippocampus_bytes[i * HIPPO_SIZE:(i + 1) * HIPPO_SIZE]
+        vals = struct.unpack(HIPPO_FORMAT, chunk)
+        text = texts[i] if i < len(texts) else ""
+        rows.append({
+            "mempack_id":     mempack_id,
+            "pattern_idx":    start_idx + i,
+            "pattern_id":     vals[0],
+            "format_version": vals[1],
+            "cartridge_type": vals[2],
+            "parent_ptr":     vals[3],
+            "child_ptr":      vals[4],
+            "sibling_ptr":    vals[5],
+            "source_hash":    vals[6],
+            "sequence_num":   vals[7],
+            "ts_unix":        vals[8],
+            "flags":          vals[9],
+            "perms_byte":     vals[10],
+            "text_preview":   (text or "")[:200],
+            "text_length":    len((text or "").encode("utf-8")),
+            # PostgREST serializes payloads to JSON; bytea columns accept hex
+            # `\x...` strings, which Postgres decodes on insert.
+            "hippocampus_raw": "\\x" + chunk.hex(),
+        })
+
+    # Batch insert in chunks of 200 (supabase-py / PostgREST default payload cap)
+    inserted = 0
+    for batch_start in range(0, len(rows), 200):
+        batch = rows[batch_start:batch_start + 200]
+        res = sb.table("mempack_patterns").insert(batch).execute()
+        inserted += len(res.data) if res.data else 0
+    return inserted
+
+
+def delete_pattern_rows_for(mempack_id: str) -> None:
+    """Wipe all per-pattern rows for a mempack. Used before cart-update re-sync."""
+    sb = get_client()
+    sb.table("mempack_patterns").delete().eq("mempack_id", mempack_id).execute()
+
+
+def append_pattern_row(
+    mempack_id: str,
+    pattern_idx: int,
+    h_block_bytes: bytes,
+    text: str,
+) -> dict:
+    """Insert a single new pattern row at an absolute pattern_idx.
+
+    Used by the agent write path (memory_store on a Mempack) where each store
+    adds one pattern at a known absolute index. Distinct from insert_pattern_rows
+    which is for bulk-build flows where pattern_idx is batch-local.
+
+    Args:
+        mempack_id:    UUID of the parent Mempack
+        pattern_idx:   absolute 0-based position in the cart's arrays
+        h_block_bytes: the 64-byte canonical H-block for this pattern
+        text:          the pattern's full text body
+
+    Returns: the inserted row dict (with id, generated columns populated).
+    """
+    if len(h_block_bytes) != HIPPO_SIZE:
+        raise ValueError(f"h_block_bytes must be {HIPPO_SIZE} bytes, got {len(h_block_bytes)}")
+
+    vals = struct.unpack(HIPPO_FORMAT, h_block_bytes)
+    row = {
+        "mempack_id":     mempack_id,
+        "pattern_idx":    pattern_idx,
+        "pattern_id":     vals[0],
+        "format_version": vals[1],
+        "cartridge_type": vals[2],
+        "parent_ptr":     vals[3],
+        "child_ptr":      vals[4],
+        "sibling_ptr":    vals[5],
+        "source_hash":    vals[6],
+        "sequence_num":   vals[7],
+        "ts_unix":        vals[8],
+        "flags":          vals[9],
+        "perms_byte":     vals[10],
+        "text_preview":   (text or "")[:200],
+        "text_length":    len((text or "").encode("utf-8")),
+        "hippocampus_raw": "\\x" + h_block_bytes.hex(),
+    }
+    sb = get_client()
+    res = sb.table("mempack_patterns").insert(row).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_mempack_metadata(
+    mempack_id: str,
+    size_bytes: int | None = None,
+    pattern_count: int | None = None,
+    pattern_i_text: str | None = None,
+) -> dict:
+    """Update a Mempack row's metadata after a write.
+    Always bumps updated_at to now() via the database default-on-update behavior
+    (or explicit if the schema doesn't auto-update).
+
+    pattern_i_text: when Pattern I is rewritten, the denormalized copy on the
+    mempacks row needs to follow. Pass the new text; pass None to leave it alone.
+    """
+    sb = get_client()
+    patch: dict = {}
+    if size_bytes is not None:
+        patch["size_bytes"] = size_bytes
+    if pattern_count is not None:
+        patch["pattern_count"] = pattern_count
+    if pattern_i_text is not None:
+        patch["pattern_i_text"] = pattern_i_text
+    # Force updated_at refresh
+    from datetime import datetime, timezone
+    patch["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if not patch:
+        return {}
+    res = sb.table("mempacks").update(patch).eq("id", mempack_id).execute()
+    return res.data[0] if res.data else {}
+
+
+def update_pattern_row(
+    mempack_id: str,
+    pattern_idx: int,
+    h_block_bytes: bytes,
+    text: str,
+) -> dict:
+    """Update an existing pattern row in-place at (mempack_id, pattern_idx).
+
+    Used by Pattern-I rewrites and any future slot-specific overwrite (e.g.
+    Pattern J entry edits). Distinct from append_pattern_row which is the
+    write-new-row path used by memory_store.
+
+    Args:
+        mempack_id:    UUID of the parent Mempack
+        pattern_idx:   absolute 0-based slot to overwrite (must already exist)
+        h_block_bytes: replacement 64-byte canonical H-block
+        text:          replacement pattern body
+
+    Returns: the updated row dict, or {} if no row matched (caller should treat
+    that as an error and fall back to append).
+    """
+    if len(h_block_bytes) != HIPPO_SIZE:
+        raise ValueError(f"h_block_bytes must be {HIPPO_SIZE} bytes, got {len(h_block_bytes)}")
+
+    vals = struct.unpack(HIPPO_FORMAT, h_block_bytes)
+    patch = {
+        "pattern_id":     vals[0],
+        "format_version": vals[1],
+        "cartridge_type": vals[2],
+        "parent_ptr":     vals[3],
+        "child_ptr":      vals[4],
+        "sibling_ptr":    vals[5],
+        "source_hash":    vals[6],
+        "sequence_num":   vals[7],
+        "ts_unix":        vals[8],
+        "flags":          vals[9],
+        "perms_byte":     vals[10],
+        "text_preview":   (text or "")[:200],
+        "text_length":    len((text or "").encode("utf-8")),
+        "hippocampus_raw": "\\x" + h_block_bytes.hex(),
+    }
+    sb = get_client()
+    res = (
+        sb.table("mempack_patterns")
+        .update(patch)
+        .eq("mempack_id", mempack_id)
+        .eq("pattern_idx", pattern_idx)
+        .execute()
+    )
+    return res.data[0] if res.data else {}
+
+
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+
+def log_provision(
+    owner_id: str,
+    mempack_id: Optional[str],
+    trigger_source: str,
+    outcome: str,
+    error: Optional[str] = None,
+) -> None:
+    """Append one row to public.mempack_provisions_log.
+
+    trigger_source: 'lazy_list' | 'manual' | 'signup_trigger' | 'migration'
+    outcome:        'created' | 'already_existed' | 'failed'
+    """
+    sb = get_client()
+    sb.table("mempack_provisions_log").insert({
+        "user_id":        owner_id,
+        "mempack_id":     mempack_id,
+        "trigger_source": trigger_source,
+        "outcome":        outcome,
+        "error_message":  error,
+    }).execute()
+
+
+# ---------------------------------------------------------------------------
+# Activity log — per-event stream the dashboard polls.
+#
+# Schema lives in db/003_mempack_activity.sql. Service role bypasses RLS for
+# inserts; users read via the user-jwt-scoped GET endpoint.
+# ---------------------------------------------------------------------------
+
+def append_activity(
+    mempack_id: str,
+    event_type: str,
+    summary: str,
+    pattern_idx: Optional[int] = None,
+    metadata: Optional[dict] = None,
+    agent_label: Optional[str] = None,
+) -> None:
+    """Insert one row into public.mempack_activity.
+
+    Caller is responsible for honoring the per-Mempack
+    activity_logging_enabled flag if user opt-out should apply. This function
+    is the unconditional write path so we can still record provisioning /
+    administrative events even when user-facing logging is off.
+
+    event_type vocabulary (open):
+        'create'           — Mempack provisioned
+        'mount'            — agent mounted the cart
+        'imprint'          — new pattern appended (memory_store)
+        'pattern_update'   — existing pattern overwritten
+        'pattern_i_update' — Pattern I (idx=1) rewritten
+        'copy_in'          — passage copied into this Mempack from elsewhere
+        'copy_out'         — passage copied out of this Mempack
+    """
+    sb = get_client()
+    row: dict = {
+        "mempack_id": mempack_id,
+        "event_type": event_type,
+        "summary":    summary,
+    }
+    if pattern_idx is not None:
+        row["pattern_idx"] = pattern_idx
+    if metadata is not None:
+        row["metadata"] = metadata
+    if agent_label is not None:
+        row["agent_label"] = agent_label
+    sb.table("mempack_activity").insert(row).execute()
+
+
+def list_activity(
+    mempack_id: str,
+    since_ts: Optional[str] = None,
+    limit: int = 100,
+    event_types: Optional[list[str]] = None,
+) -> list[dict]:
+    """Return activity rows for a Mempack, newest first.
+
+    Args:
+        mempack_id:  UUID of the Mempack
+        since_ts:    ISO timestamp; if given, only events strictly newer than
+                     this are returned. Used by the dashboard for delta polling.
+        limit:       max rows (default 100)
+        event_types: optional list of event_type strings to filter to
+    """
+    sb = get_client()
+    q = (
+        sb.table("mempack_activity")
+        .select("*")
+        .eq("mempack_id", mempack_id)
+        .order("created_at", desc=True)
+        .limit(limit)
+    )
+    if since_ts:
+        q = q.gt("created_at", since_ts)
+    if event_types:
+        q = q.in_("event_type", event_types)
+    res = q.execute()
+    return res.data or []
+
+
+def is_logging_enabled(mempack_id: str) -> bool:
+    """Read the per-Mempack activity_logging_enabled flag.
+
+    Default-true on missing row or query oddities — fail open. Disabling logs
+    is a deliberate user opt-out, so an unexpected None should not silently
+    suppress.
+    """
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("activity_logging_enabled")
+        .eq("id", mempack_id)
+        .maybe_single()
+        .execute()
+    )
+    if not res or not res.data:
+        return True
+    return bool(res.data.get("activity_logging_enabled", True))
+
+
+def set_logging_enabled(mempack_id: str, enabled: bool) -> dict:
+    """Toggle the per-Mempack activity_logging_enabled flag."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .update({"activity_logging_enabled": enabled})
+        .eq("id", mempack_id)
+        .execute()
+    )
+    return res.data[0] if res.data else {}
+
+
+# ---------------------------------------------------------------------------
+# Mempack lookups by id (companion to get_mempack_by_name)
+# ---------------------------------------------------------------------------
+
+def get_mempack_by_id(mempack_id: str) -> Optional[dict]:
+    """Return the mempack row by primary key, or None if not present."""
+    sb = get_client()
+    res = (
+        sb.table("mempacks")
+        .select("*")
+        .eq("id", mempack_id)
+        .maybe_single()
+        .execute()
+    )
+    return res.data if res else None
+
+
+# ---------------------------------------------------------------------------
+# Auth lookups (service role can read auth.users via the admin API)
+# ---------------------------------------------------------------------------
+
+def find_user_uuid_by_email(email: str) -> Optional[str]:
+    """Look up a Supabase auth user's UUID by email. Service role only.
+
+    Useful for the one-shot migration script when we need to map a synthetic
+    owner_id (smoke-test mempack) to a real user. Iterates paged user list.
+    """
+    sb = get_client()
+    page = 1
+    per_page = 200
+    while True:
+        try:
+            resp = sb.auth.admin.list_users(page=page, per_page=per_page)
+        except Exception:
+            return None
+        # supabase-py returns either a list-like or an object with `.users`
+        users = getattr(resp, "users", None) or (resp if isinstance(resp, list) else [])
+        if not users:
+            return None
+        for u in users:
+            uemail = getattr(u, "email", None) or (u.get("email") if isinstance(u, dict) else None)
+            if uemail == email:
+                return getattr(u, "id", None) or (u.get("id") if isinstance(u, dict) else None)
+        if len(users) < per_page:
+            return None
+        page += 1
+
+
+# ---------------------------------------------------------------------------
+# High-level convenience: provision a fresh starter Mempack for a user
+# ---------------------------------------------------------------------------
+
+def auto_provision_primary(
+    owner_id: str,
+    starter_blob_bytes: bytes,
+    starter_hippocampus: bytes,
+    starter_texts: list[str],
+    pattern_count: int,
+    briefing: str,
+    pattern_i_text: str,
+    manifest: dict,
+    trigger_source: str = "lazy_list",
+) -> dict:
+    """Idempotent provision of a user's primary Mempack.
+
+    If `primary` already exists for owner_id: log 'already_existed', return
+    the existing row.
+
+    Otherwise: insert row (status='pending') -> upload blob -> mark 'ready'
+    -> insert per-pattern rows -> log 'created' -> return row.
+
+    On any failure mid-way: log 'failed' with error message; caller decides
+    whether to clean up the partial state or leave for reconciliation.
+    """
+    existing = get_mempack_by_name(owner_id, "primary")
+    if existing:
+        log_provision(owner_id, existing["id"], trigger_source, "already_existed")
+        return existing
+
+    try:
+        row = insert_mempack(
+            owner_id=owner_id,
+            name="primary",
+            pattern_count=pattern_count,
+            size_bytes=len(starter_blob_bytes),
+            briefing=briefing,
+            pattern_i_text=pattern_i_text,
+            manifest=manifest,
+            cart_type="agent-memory",
+            status="pending",
+        )
+        mempack_id = row["id"]
+
+        upload_blob(owner_id, "primary", starter_blob_bytes)
+        insert_pattern_rows(mempack_id, starter_hippocampus, starter_texts)
+        mark_mempack_ready(mempack_id)
+
+        log_provision(owner_id, mempack_id, trigger_source, "created")
+        # Activity log: 'create' event so the dashboard's first feed entry is
+        # the Mempack's birthday. Unconditional — pre-dates any user toggle.
+        try:
+            append_activity(
+                mempack_id=mempack_id,
+                event_type="create",
+                summary=f"Mempack 'primary' provisioned ({trigger_source})",
+                metadata={
+                    "blob_bytes":    len(starter_blob_bytes),
+                    "pattern_count": pattern_count,
+                    "trigger":       trigger_source,
+                },
+            )
+        except Exception:
+            pass  # best-effort; mempack_provisions_log is the authoritative audit
+        # Refetch with status='ready' set
+        return get_mempack_by_name(owner_id, "primary") or row
+    except Exception as e:
+        log_provision(owner_id, None, trigger_source, "failed", error=str(e))
+        raise
