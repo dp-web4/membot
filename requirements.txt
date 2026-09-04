@@ -1,4 +1,9 @@
 mcp[cli]>=1.0.0
+# membot_server.py:45 imports fastmcp directly. It was never listed here; the old
+# environment satisfied it by an ad-hoc install, so the dependency was invisible until
+# the 2026-09-03 workspace move rebuilt the venv from this file and the server would
+# not start. Listed now so the manifest matches the imports.
+fastmcp>=4.0.0
 numpy>=1.24.0
 sentence-transformers>=2.2.0
 einops>=0.7.0
