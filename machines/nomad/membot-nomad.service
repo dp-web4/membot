@@ -1,0 +1,29 @@
+[Unit]
+Description=Membot Brain Cartridge Server (Nomad) — long-term memory for nomad-being
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/c/projects/ai-agents/membot
+# Loopback only. The server's default bind is 0.0.0.0, which would put a WRITABLE
+# memory store on the tailnet. The being's dispatcher dials 127.0.0.1:8010 and
+# nothing off-box has any business writing this cartridge.
+#
+# Port 8010, not 8000: that is the endpoint SAGE's HestiaF1aDispatcher defaults to
+# (sage/gateway/hestia_dispatch.py, membot_endpoint).
+#
+# --writable is required. The default is --read-only, which disables memory_store
+# and save_cartridge, and the being's `remember` verb needs both. A read-only
+# server answers the health probe and then fails every write, which is a confusing
+# way to be misconfigured.
+ExecStart=/usr/bin/python3 membot_server.py --transport http --host 127.0.0.1 --port 8010 --writable --mount nomad-being
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+# 16GB laptop shared with ollama (gemma4:e2b) and the hestia daemon. The
+# SentenceTransformer backend (nomic-embed-text-v1.5) loads lazily on the first
+# store or recall, not at startup, so the resident cost is small until first use.
+MemoryMax=3G
+
+[Install]
+WantedBy=default.target

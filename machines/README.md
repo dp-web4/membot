@@ -16,6 +16,7 @@ If the standard setup (`pip install -r requirements.txt && python membot_server.
 | Machine | Why | Key Adaptation |
 |---------|-----|----------------|
 | `sprout/` | Jetson Orin Nano 8GB, ARM64, no GLIBC 2.38 | Ollama embedding backend instead of SentenceTransformer |
+| `nomad/` | WSL2 laptop; serves one consumer, the being `nomad-being` | User-scope systemd unit, loopback bind, port 8010 (SAGE dispatcher default) |
 
 ## Standard Setup (Most Machines)
 
