@@ -17,6 +17,10 @@ WorkingDirectory=/mnt/c/projects/ai-agents/membot
 # server answers the health probe and then fails every write, which is a confusing
 # way to be misconfigured.
 ExecStart=/usr/bin/python3 membot_server.py --transport http --host 127.0.0.1 --port 8010 --writable --mount nomad-being
+# Force the embedding model to load NOW rather than on the being's first remember, which
+# it would otherwise time out (~35s cold, measured twice on 2026-09-09). The `-` prefix
+# means a failed warmup never keeps the service down.
+ExecStartPost=-/usr/bin/python3 machines/nomad/warm_membot.py nomad-being
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=10
