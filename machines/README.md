@@ -17,6 +17,7 @@ If the standard setup (`pip install -r requirements.txt && python membot_server.
 |---------|-----|----------------|
 | `sprout/` | Jetson Orin Nano 8GB, ARM64, no GLIBC 2.38 | Ollama embedding backend instead of SentenceTransformer |
 | `nomad/` | WSL2 laptop; serves one consumer, the being `nomad-being` | User-scope systemd unit, loopback bind, port 8010 (SAGE dispatcher default) |
+| `cbp/` | WSL2 desktop, 8GB GPU owned by the being `cbp-being` | CPU embedder (`MEMBOT_EMBED_BACKEND=st`, GPU hidden) for the shared server and the being's loopback server on 8010 |
 
 ## Standard Setup (Most Machines)
 
