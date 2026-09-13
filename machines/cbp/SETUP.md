@@ -40,8 +40,12 @@ membot's on the GPU.
 
 The shared server loads the model lazily. `POST /api/embed {"texts":["warm"]}` loads it
 without mounting any cartridge, which matters on a server other members' hooks share.
-The being's launcher runs `machines/nomad/warm_membot.py cbp-being` after start (that
-script dials 127.0.0.1:8010, which is also the being's port here).
+The being's launcher warms with `POST /api/embed` on 8010 too. It first used
+`machines/nomad/warm_membot.py`, which warms with a `memory_search`; measured here on
+2026-09-13, a search against an EMPTY cartridge returns before embedding, so the model
+stayed cold and the being's first `remember` paid the 12 s load and timed out (the store
+guard correctly skipped the save). That warm-up only works once the cartridge holds a
+memory, which is exactly the case where the first remember has already happened.
 
 ## Caveat: older cartridges on the shared server
 
