@@ -171,9 +171,11 @@ class TestResourceConstraints(unittest.TestCase):
 
     def test_no_sentence_transformers_on_sprout(self):
         """On Sprout (ARM64 Jetson), sentence-transformers should NOT be loaded."""
-        import platform
-        if platform.machine() != "aarch64":
-            self.skipTest("Not on ARM64 — sentence-transformers check not applicable")
+        import socket
+        # Gate on hostname, not arch: thor is also aarch64 and legitimately runs
+        # SentenceTransformer (MEMBOT_EMBED_BACKEND=auto prefers Ollama when up).
+        if "sprout" not in socket.gethostname().lower():
+            self.skipTest("Not on Sprout — sentence-transformers check not applicable")
 
         # Check if sentence_transformers is importable (it shouldn't be on Sprout)
         try:
