@@ -18,6 +18,9 @@ import urllib.error
 
 MEMBOT_URL = os.environ.get("MEMBOT_URL", "http://localhost:8000")
 TEST_CARTRIDGE = "fleet-test-ephemeral"
+# All mounts/stores/searches run in a dedicated session slot so the suite never
+# displaces a production cartridge (e.g. thor-memory) from the 'default' slot.
+TEST_SESSION = "fleet-test"
 
 
 def api(method, path, data=None, timeout=10):
@@ -25,6 +28,7 @@ def api(method, path, data=None, timeout=10):
     url = f"{MEMBOT_URL}{path}"
     req = urllib.request.Request(url, method=method)
     if data:
+        data = {"session_id": TEST_SESSION, **data}
         req.data = json.dumps(data).encode()
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
