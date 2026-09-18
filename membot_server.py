@@ -104,6 +104,21 @@ RECENCY_HALF_LIFE = 86400.0   # 24h — recency weight halves per day (0 = disab
 MAX_ENTRIES = 3_000_000      # Max memories per cartridge (supports 2.4M arXiv)
 MAX_TEXT_LENGTH = 10_000     # Max characters per memory_store call
 MAX_QUERY_LENGTH = 2_000    # Max characters per search query
+
+# CHUNK ON STORE. A long note stored as ONE passage is retrievable only as a whole: the
+# cartridge ranks it by a single embedding over everything it says, the search preview
+# shows its first ~550 characters, and get_passage returns the entire thing or nothing.
+# Both ends of that are wrong for a reader -- the ranking is blurred by every subject the
+# note is NOT being searched for, and the retrieval has no unit smaller than the note.
+#
+# cartridge_builder.chunk_text has always done this when a cartridge is BUILT (300 words,
+# 50 overlap). Nothing did it when one was WRITTEN, so an agent's own notes were the only
+# passages in its memory that could not be retrieved by section. Long stores now go
+# through the same splitter, and each piece ranks and reads on its own. Below the
+# threshold, one store is one passage, byte-identical to before.
+CHUNK_STORE_MIN_CHARS = int(os.getenv("MEMBOT_CHUNK_STORE_MIN_CHARS", "1200"))
+CHUNK_STORE_WORDS = int(os.getenv("MEMBOT_CHUNK_STORE_WORDS", "300"))
+CHUNK_STORE_OVERLAP = int(os.getenv("MEMBOT_CHUNK_STORE_OVERLAP", "50"))
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
 
 
@@ -5644,11 +5659,40 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
         return f"mempack_update_pattern_i error: {e}"
 
 
+def _chunk_for_store(content: str) -> list[str]:
+    """Split one store into the passages it will be retrieved as.
+
+    Short content passes through whole -- one store, one passage, unchanged. Long content
+    is split by cartridge_builder.chunk_text, the same splitter cartridges are BUILT with,
+    so a written passage and an ingested one have the same shape. A caller that knows its
+    own boundaries can place ---PASSAGE_BREAK--- sentinels and chunk_text will honour them
+    instead of counting words.
+
+    Never raises. If the splitter cannot be imported or throws, the content is stored
+    whole, which is exactly what happened before this function existed.
+    """
+    text = content.strip()
+    if len(text) <= CHUNK_STORE_MIN_CHARS and "---PASSAGE_BREAK---" not in text:
+        return [text]
+    try:
+        from cartridge_builder import chunk_text
+        chunks = [c.strip() for c in chunk_text(text, CHUNK_STORE_WORDS, CHUNK_STORE_OVERLAP)]
+    except Exception as e:
+        log.warning(f"chunk-on-store unavailable ({e}); storing whole")
+        return [text]
+    return [c for c in chunks if c] or [text]
+
+
 @mcp.tool()
 def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     """Store new text in the currently mounted cartridge.
     The text is embedded via Nomic and added to the searchable memory.
     If GPU is available, the pattern is also imprinted into the lattice.
+
+    Content longer than ~1,200 characters is split into overlapping passages (300 words,
+    50 overlap) so it can be recalled by section rather than only as a whole; each piece
+    is labelled "(part i/n)" and they occupy consecutive indices. Put ---PASSAGE_BREAK---
+    where you want the splits if the word count is the wrong boundary.
 
     Args:
         content: Text content to memorize (max 10,000 chars)
@@ -5676,68 +5720,106 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if n_current >= MAX_ENTRIES:
         return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
+    pieces = _chunk_for_store(content)
+    n_pieces = len(pieces)
+    # ROOM FOR THE WHOLE ENTRY OR NONE OF IT. A chunked store that ran out of room
+    # half-way would leave "(part 3/7)" as the end of a memory, and nothing would say so.
+    if n_current + n_pieces > MAX_ENTRIES:
+        return (f"Cartridge full ({n_current}/{MAX_ENTRIES}); this entry needs {n_pieces} "
+                f"more. Save and start a new cartridge.")
+
+    def _passage(i: int) -> str:
+        part = f"(part {i + 1}/{n_pieces}) " if n_pieces > 1 else ""
+        return f"[{tags}] {part}{pieces[i]}" if tags else f"{part}{pieces[i]}"
+
     # Exact-dedup: refuse byte-identical re-stores. Clients (e.g. snarc's bridge)
     # re-emit recurring patterns every session; storing the same entry twice only
     # bloats the cartridge and pollutes recall. No-op skip, not an error.
-    stored_text = f"[{tags}] {content}" if tags else content
-    if state["texts"] and stored_text in state["texts"]:
+    # Per PIECE, not per call. That is weaker than it sounds and the limit is worth
+    # stating: the label carries the TOTAL, so appending a paragraph to a note can change
+    # n_pieces, change every label, and re-store the whole thing. What it does buy is a
+    # re-store of the IDENTICAL note skipping silently, which is the case that actually
+    # recurs, and a piece-level skip whenever the split lands the same way.
+    existing = set(state["texts"]) if state["texts"] else set()
+    fresh = [(i, _passage(i)) for i in range(n_pieces)]
+    n_dupes = sum(1 for _, t in fresh if t in existing)
+    fresh = [(i, t) for i, t in fresh if t not in existing]
+    if not fresh:
         return f"Duplicate — already stored, skipped: \"{content[:60]}\""
 
-    log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack})")
+    log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack}, "
+             f"pieces={n_pieces}, new={len(fresh)})")
 
     try:
         t0 = time.time()
-
-        # 1. Embed via Nomic
-        emb = embed_text(content, prefix="search_document")
-
-        # 2. Add to embedding matrix
-        if state["embeddings"] is None or len(state["embeddings"]) == 0:
-            state["embeddings"] = emb.reshape(1, -1)
-        else:
-            state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
-
-        # 3. Extend binary corpus (sign_zero for Hamming search)
-        new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
-        if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
-            state["binary_corpus"] = new_bin
-        else:
-            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
-
-        # 4. Store text
-        stored_text = f"[{tags}] {content}" if tags else content
-        state["texts"].append(stored_text)
-        state["modified"] = True
-
-        # 5. GPU lattice imprint (if available)
+        idxs = []
         gpu_msg = ""
-        if _gpu_state["available"] and _gpu_state["lattice"] is not None:
-            try:
-                ml = _gpu_state["lattice"]
-                ml.reset()
-                ml.imprint_vector(emb)
-                ml.settle(frames=10, learn=True)
-                gpu_msg = " + lattice imprint"
-            except Exception as e:
-                gpu_msg = f" (lattice failed: {e})"
-                log.warning(f"Lattice imprint failed: {e}")
-
-        # 6. Mempack persistence: if this is a Supabase-backed Mempack, round-trip
-        # the new pattern back to Storage + mempack_patterns. Last-writer-wins
-        # for v1; concurrent writes from two agents to the same Mempack are
-        # rare enough to defer optimistic-locking to v1.2.
         persist_msg = ""
-        if state.get("mempack_id") and _supabase_available():
-            try:
-                persist_msg = " + " + _mempack_persist_new_pattern(state, stored_text, emb)
-            except Exception as e:
-                persist_msg = f" (Mempack persistence FAILED: {e})"
-                log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
+
+        for i, stored_text in fresh:
+            # 1. Embed via Nomic. The PIECE, not its label: a "(part 2/5)" prefix in the
+            # vector would move every chunked passage toward every other one.
+            emb = embed_text(pieces[i], prefix="search_document")
+
+            # 2. Add to embedding matrix
+            if state["embeddings"] is None or len(state["embeddings"]) == 0:
+                state["embeddings"] = emb.reshape(1, -1)
+            else:
+                state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
+
+            # 3. Extend binary corpus (sign_zero for Hamming search)
+            new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
+            if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
+                state["binary_corpus"] = new_bin
+            else:
+                state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
+
+            # 4. Store text
+            state["texts"].append(stored_text)
+            state["modified"] = True
+            idxs.append(len(state["texts"]) - 1)
+            # A STORE IS WHAT MAKES AN EMPTY CARTRIDGE SEARCHABLE BY MEANING, and only
+            # mount_cartridge set this flag. A session that mounted an EMPTY cart got
+            # has_embeddings=False and kept it for the life of the session, so every
+            # search ran hamming-only over vectors that were right there -- the shape a
+            # new being on a fresh cartridge lives in for its whole first session.
+            state["has_embeddings"] = True
+
+            # 5. GPU lattice imprint (if available)
+            if _gpu_state["available"] and _gpu_state["lattice"] is not None:
+                try:
+                    ml = _gpu_state["lattice"]
+                    ml.reset()
+                    ml.imprint_vector(emb)
+                    ml.settle(frames=10, learn=True)
+                    gpu_msg = " + lattice imprint"
+                except Exception as e:
+                    gpu_msg = f" (lattice failed: {e})"
+                    log.warning(f"Lattice imprint failed: {e}")
+
+            # 6. Mempack persistence: if this is a Supabase-backed Mempack, round-trip
+            # the new pattern back to Storage + mempack_patterns. Last-writer-wins
+            # for v1; concurrent writes from two agents to the same Mempack are
+            # rare enough to defer optimistic-locking to v1.2.
+            if state.get("mempack_id") and _supabase_available():
+                try:
+                    persist_msg = " + " + _mempack_persist_new_pattern(state, stored_text, emb)
+                except Exception as e:
+                    persist_msg = f" (Mempack persistence FAILED: {e})"
+                    log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
 
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
-
-        return f"Stored memory #{n}{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
+        skipped = f", {n_dupes} already stored" if n_dupes else ""
+        # The INDEX is what get_passage takes, and it is not the "#n" count: a store that
+        # reported only "#348" sent every reader that walked it to the passage before.
+        if len(idxs) == 1 and n_pieces == 1:
+            where = f"#{n} (idx {idxs[0]})"
+        else:
+            plural = "" if len(idxs) == 1 else "s"
+            where = (f"#{n - len(idxs) + 1}-#{n} in {len(idxs)} part{plural} "
+                     f"(idx {idxs[0]}-{idxs[-1]}{skipped})")
+        return f"Stored memory {where}{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
 
     except Exception as e:
         log.error(f"Store error: {e}")
