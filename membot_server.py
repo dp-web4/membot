@@ -434,10 +434,30 @@ def _ollama_available() -> bool:
     except Exception:
         return False
 
+# THE GPU BELONGS TO THE BEING. dp, 2026-09-13: "we've moved membot to cpu on other
+# machines, we should do that here also." CBP and Nomad reach that by running
+# sentence-transformers in-process (MEMBOT_EMBED_BACKEND=st); a host with no torch --
+# Legion has neither torch nor sentence_transformers installed -- cannot, and would
+# silently keep embedding on the accelerator its being is sitting on.
+#
+# `num_gpu: 0` gets the same outcome through the ollama backend with nothing to install.
+# Measured on Legion 2026-09-14: the being's model holds 14.9 GB of a 16,376 MiB card, and
+# an embed WITHOUT this option loads nomic-embed-text into the remaining ~1.1 GB beside it
+# -- the contention class that has already cost this machine a swap stall and a watchdog
+# kill. With it, nomic reports 0.00 GB on VRAM.
+#
+# Default 0 (CPU) because that is the fleet's decision; set MEMBOT_OLLAMA_EMBED_NUM_GPU to
+# a layer count on a host where the accelerator is genuinely free.
+_ollama_embed_num_gpu = int(os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU", "0"))
+
+
 def _embed_via_ollama(text: str) -> np.ndarray:
-    """Get embedding from Ollama API (no extra RAM — reuses running Ollama process)."""
+    """Get embedding from Ollama API (no extra RAM -- reuses running Ollama process).
+
+    Embeds on the CPU by default: see _ollama_embed_num_gpu above."""
     import urllib.request
-    payload = json.dumps({"model": _ollama_embed_model, "input": text}).encode()
+    payload = json.dumps({"model": _ollama_embed_model, "input": text,
+                          "options": {"num_gpu": _ollama_embed_num_gpu}}).encode()
     req = urllib.request.Request(
         f"{_ollama_url}/api/embed",
         data=payload,
