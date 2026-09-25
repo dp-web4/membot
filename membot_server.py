@@ -101,9 +101,16 @@ HAMMING_BLEND = 0.3           # 70% cosine + 30% sign_zero Hamming (replaces phy
 RECENCY_HALF_LIFE = 86400.0   # 24h — recency weight halves per day (0 = disabled)
 
 # --- Security Limits ---
-MAX_ENTRIES = 3_000_000      # Max memories per cartridge (supports 2.4M arXiv)
-MAX_TEXT_LENGTH = 10_000     # Max characters per memory_store call
-MAX_QUERY_LENGTH = 2_000    # Max characters per search query
+# THESE ARE PUBLIC-SERVER LIMITS, AND MOST MEMBOT INSTANCES ARE NOT PUBLIC SERVERS. A local
+# instance is one trusted user's own memory on loopback; a 10k cap there does not stop an
+# attacker, it refuses the memories worth keeping. Measured 2026-09-25 while ingesting a
+# seat's memory corpus into a local cartridge: 86 of 140 documents were rejected, the largest
+# 57,917 chars, and the workaround was to chop them into parts -- damage to the thing being
+# stored, in service of a number chosen for a threat model this instance does not have.
+# Env-overridable now, so the deployment decides rather than the constant.
+MAX_ENTRIES = int(os.environ.get("MEMBOT_MAX_ENTRIES", 3_000_000))
+MAX_TEXT_LENGTH = int(os.environ.get("MEMBOT_MAX_TEXT_LENGTH", 10_000))
+MAX_QUERY_LENGTH = int(os.environ.get("MEMBOT_MAX_QUERY_LENGTH", 2_000))
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
 
 
@@ -7060,8 +7067,16 @@ def walk_associate(
 
 # --- Rate Limiter (sliding window, per-IP) ---
 _rate_window: dict[str, collections.deque] = {}
-RATE_LIMIT = 60          # requests per window
-RATE_WINDOW_SEC = 60     # window size in seconds
+RATE_LIMIT = int(os.environ.get("MEMBOT_RATE_LIMIT", 60))            # requests per window
+RATE_WINDOW_SEC = int(os.environ.get("MEMBOT_RATE_WINDOW_SEC", 60))  # window size in seconds
+# LOOPBACK IS EXEMPT BY DEFAULT. The limiter keys on client IP, so on a local box every
+# client -- the agent, its tools, the REST bridge -- shares ONE 60/minute budget and they
+# throttle each other. Measured 2026-09-25: a bulk ingest consumed the window, and the
+# save_cartridge call was rate-limited too, leaving 54 freshly embedded memories unsaved
+# while the caller was told only "Rate limited". A dropped save is data loss dressed as
+# throttling. Set MEMBOT_RATE_LIMIT_LOOPBACK=1 to police loopback as well.
+RATE_LIMIT_LOOPBACK = os.environ.get("MEMBOT_RATE_LIMIT_LOOPBACK", "").strip() == "1"
+_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
 
 def _check_rate_limit(client_id: str) -> bool:
@@ -7098,7 +7113,8 @@ def _setup_http_middleware(api_key: str | None):
 
             # Rate limiting by client IP
             client_ip = request.client.host if request.client else "unknown"
-            if not _check_rate_limit(client_ip):
+            if (client_ip not in _LOOPBACK or RATE_LIMIT_LOOPBACK) \
+                    and not _check_rate_limit(client_ip):
                 from fastmcp.exceptions import ToolError
                 log.warning(f"Rate limited: {client_ip}")
                 raise ToolError(f"Rate limited. Max {RATE_LIMIT} requests per {RATE_WINDOW_SEC}s.")
