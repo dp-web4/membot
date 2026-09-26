@@ -7069,14 +7069,39 @@ def walk_associate(
 _rate_window: dict[str, collections.deque] = {}
 RATE_LIMIT = int(os.environ.get("MEMBOT_RATE_LIMIT", 60))            # requests per window
 RATE_WINDOW_SEC = int(os.environ.get("MEMBOT_RATE_WINDOW_SEC", 60))  # window size in seconds
-# LOOPBACK IS EXEMPT BY DEFAULT. The limiter keys on client IP, so on a local box every
-# client -- the agent, its tools, the REST bridge -- shares ONE 60/minute budget and they
-# throttle each other. Measured 2026-09-25: a bulk ingest consumed the window, and the
-# save_cartridge call was rate-limited too, leaving 54 freshly embedded memories unsaved
-# while the caller was told only "Rate limited". A dropped save is data loss dressed as
-# throttling. Set MEMBOT_RATE_LIMIT_LOOPBACK=1 to police loopback as well.
-RATE_LIMIT_LOOPBACK = os.environ.get("MEMBOT_RATE_LIMIT_LOOPBACK", "").strip() == "1"
-_LOOPBACK = {"127.0.0.1", "::1", "localhost"}
+# LOOPBACK MAY BE EXEMPTED, AND ONLY BY OPT-IN. The limiter keys on client IP, so on a local
+# box every client (the agent, its tools, the REST bridge) shares ONE 60/minute budget and they
+# throttle each other. Measured 2026-09-25: a bulk ingest consumed the window, and
+# save_cartridge was rate-limited too, leaving 54 freshly embedded memories unsaved while the
+# caller saw only "Rate limited". A dropped save is data loss dressed as throttling.
+#
+# It is NOT the default. The first version of this change exempted loopback unconditionally,
+# but "Behind a Reverse Proxy" (README) puts nginx on the same host with
+# proxy_pass http://127.0.0.1:8000, so EVERY public request arrives from loopback. The default
+# would have switched the limiter off for a public instance. A public membot must stay bounded
+# with no configuration, so a local deployment that wants the exemption says so:
+# MEMBOT_RATE_LIMIT_LOOPBACK_EXEMPT=1 (machines/cbp/local-limits.conf).
+RATE_LIMIT_LOOPBACK_EXEMPT = os.environ.get("MEMBOT_RATE_LIMIT_LOOPBACK_EXEMPT", "").strip() == "1"
+
+
+def _is_loopback(client_ip: str) -> bool:
+    """True for a loopback ADDRESS only: 127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x.
+
+    Parsed, not matched as strings. A hostname, "unknown", or anything unparsable is not
+    loopback. The exemption must never widen to a name a client could choose.
+    """
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
+
+
+def _rate_limit_applies(client_ip: str) -> bool:
+    """Whether this request is subject to the per-IP limiter. The single admission decision."""
+    return not (RATE_LIMIT_LOOPBACK_EXEMPT and _is_loopback(client_ip))
 
 
 def _check_rate_limit(client_id: str) -> bool:
@@ -7113,8 +7138,7 @@ def _setup_http_middleware(api_key: str | None):
 
             # Rate limiting by client IP
             client_ip = request.client.host if request.client else "unknown"
-            if (client_ip not in _LOOPBACK or RATE_LIMIT_LOOPBACK) \
-                    and not _check_rate_limit(client_ip):
+            if _rate_limit_applies(client_ip) and not _check_rate_limit(client_ip):
                 from fastmcp.exceptions import ToolError
                 log.warning(f"Rate limited: {client_ip}")
                 raise ToolError(f"Rate limited. Max {RATE_LIMIT} requests per {RATE_WINDOW_SEC}s.")
