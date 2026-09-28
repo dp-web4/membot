@@ -88,7 +88,7 @@ def main():
         check("text unchanged", st["texts"][0] == "[note] a short thing worth keeping",
               repr(st["texts"][0]))
         check("no part label", "(part " not in st["texts"][0])
-        check("reply names the idx", "(idx 0)" in out, out)
+        check("reply names the idx", "(idx:0)" in out, out)   # search's own spelling (main #5)
 
         print("\n2. long store — several passages")
         sid, st = fresh_session()
@@ -98,7 +98,7 @@ def main():
         check("every part labelled", all(f"(part {i+1}/{n})" in st["texts"][i] for i in range(n)),
               st["texts"][0][:80])
         check("tags on every part", all(t.startswith("[arc,ft09] ") for t in st["texts"]))
-        check("reply names the range", f"idx 0-{n-1}" in out, out)
+        check("reply names the range", f"idx:0-{n-1}" in out, out)
         check("reply names the count", f"{n} parts" in out, out)
         check("overlap is real", M.CHUNK_STORE_OVERLAP > 0
               and len(set(st["texts"])) == n)
