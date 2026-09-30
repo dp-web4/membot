@@ -82,3 +82,8 @@ venv/
 .venv/
 .venv/
 claude-code-nirholas
+
+# Hardbound private key (never commit)
+.hardbound/signing.key
+
+.hardbound/actors/claude/signing.key
