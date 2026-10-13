@@ -450,14 +450,25 @@ def _ollama_available() -> bool:
 # a layer count on a host where the accelerator is genuinely free.
 _ollama_embed_num_gpu = int(os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU", "0"))
 
+# HOW LONG THE EMBEDDER STAYS LOADED AFTER A SEARCH, per host (dp 2026-10-12, Sprout). Ollama keeps a
+# model 5 minutes after each request by default. On Sprout (7.4 GB unified memory, the being's 4B at
+# 3.3 GB) nomic-embed-text is 359 MB that stays resident beside the being after every recall, taking
+# room the being's thinking could use, though searches are intermittent. MEMBOT_OLLAMA_EMBED_KEEP_ALIVE
+# is passed through as Ollama's `keep_alive` ("0" unloads right after the embed; "30s", "5m", ...).
+# Unset: the field is not sent and Ollama's default applies, so nothing changes for other hosts.
+_ollama_embed_keep_alive = (os.getenv("MEMBOT_OLLAMA_EMBED_KEEP_ALIVE") or "").strip() or None
+
 
 def _embed_via_ollama(text: str) -> np.ndarray:
     """Get embedding from Ollama API (no extra RAM -- reuses running Ollama process).
 
-    Embeds on the CPU by default: see _ollama_embed_num_gpu above."""
+    Embeds on the CPU by default: see _ollama_embed_num_gpu above. Stays loaded as long as
+    _ollama_embed_keep_alive says (Ollama's default when unset)."""
     import urllib.request
-    payload = json.dumps({"model": _ollama_embed_model, "input": text,
-                          "options": {"num_gpu": _ollama_embed_num_gpu}}).encode()
+    body = {"model": _ollama_embed_model, "input": text, "options": {"num_gpu": _ollama_embed_num_gpu}}
+    if _ollama_embed_keep_alive is not None:
+        body["keep_alive"] = _ollama_embed_keep_alive
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{_ollama_url}/api/embed",
         data=payload,
