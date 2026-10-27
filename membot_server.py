@@ -5249,6 +5249,10 @@ def walk_associate_core(
             against membot's depot rather than an arbitrary `.cart.npz` path.
             Without this, a cart the sidecar mounted was unreachable from walk.
             Empty (default) = today's behaviour exactly.
+            ⚠ LIBRARY-ONLY. The `multi_cart` pool has no owner, so this
+            selector trusts its caller to be the process that mounted the cart.
+            It is NOT exposed on the `walk_associate` MCP tool, and must not be
+            without per-caller mount ownership (NOVA's HOLD on #9).
 
     Returns:
         dict with the following shape:
@@ -5327,17 +5331,17 @@ def walk_associate_core(
         import multi_cart as _mc_local
         state = _mc_local.get_cart(cart_id)
         if state is None:
-            # Name what IS mounted. A bare "not mounted" makes the caller guess
-            # between a typo and an unmounted cart, and those have different fixes.
-            mounted = sorted(m["cart_id"] for m in _mc_local.list_mounts())
+            # Name NO other mount: listing the pool would disclose cart ids other
+            # callers mounted (NOVA's HOLD on #9). The in-process caller that
+            # wants the list has `multi_cart.list_mounts()` itself.
             result["error"] = (
                 f"cart_id '{cart_id}' is not mounted. "
-                + (f"Mounted: {', '.join(mounted)}. " if mounted else "No carts are mounted. ")
-                + "Use multi_cart.mount() first, or omit cart_id to walk the session.")
+                "Use multi_cart.mount() first, or omit cart_id to walk the session.")
             return result
         cart_label = state.get("cart_name") or cart_id
         owns_state = False
-        log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, cart_id={cart_id})")
+        # cart_id, not the query: the query text of a pooled-cart walk stays out of logs.
+        log.info(f"walk_associate(top_k={top_k}, temp={temperature:.2f}, cart_id={cart_id})")
     else:
         session_id = _resolve_session_id(session_id)
         state = _get_session(session_id)
@@ -5473,9 +5477,14 @@ def walk_associate_core(
         # writing someone else's dict. See the resolution block above.
         if owns_state:
             state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id or f"cart:{cart_id}", "walk",
-                      f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
-                      elapsed_ms)
+        if owns_state:
+            _log_activity(session_id, "walk",
+                          f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
+                          elapsed_ms)
+        else:
+            _log_activity(f"cart:{cart_id}", "walk",
+                          f"cart_id={cart_id} -> primary={len(result['primary'])} missed={len(result['missed'])}",
+                          elapsed_ms)
 
         result["elapsed_ms"] = elapsed_ms
         result["header"] = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
@@ -5547,7 +5556,6 @@ def walk_associate(
     walk_max_show: int = 10,
     temperature: float = 0.0,
     session_id: str = "",
-    cart_id: str = "",
 ) -> str:
     """Walk the substrate from a seed query to surface associations beyond direct matches.
 
@@ -5582,6 +5590,11 @@ def walk_associate(
     library) should call `walk_associate_core(...)` directly and get the typed
     dict result. This @mcp.tool() wrapper exists for MCP/LLM hosts that need
     the documented text format.
+
+    ⚠ No `cart_id` here, deliberately (NOVA's HOLD on #9). `multi_cart` mounts
+    live in a process-global pool with no owner, so a network caller naming a
+    cart_id would read a cart some other client mounted. The selector is on
+    `walk_associate_core` only, for the in-process caller that mounted the cart.
     """
     result = walk_associate_core(
         query=query,
@@ -5591,7 +5604,6 @@ def walk_associate(
         walk_max_show=walk_max_show,
         temperature=temperature,
         session_id=session_id,
-        cart_id=cart_id,
     )
     return _format_walk_text(result, walk_min_hits)
 

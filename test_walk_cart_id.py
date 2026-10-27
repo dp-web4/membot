@@ -105,12 +105,12 @@ try:
     check("no query_count written into the shared cart state",
           "query_count" not in st, sorted(st.keys()))
 
-    print("\n4 - a bad cart_id fails loudly and names what IS mounted")
+    print("\n4 - a bad cart_id fails loudly and names NO other mount (NOVA's HOLD on #9)")
     bad = m.walk_associate_core("alpha", cart_id="no-such-cart")
     check("bad cart_id is an error, not a silent session fallback",
           bad["error"] is not None, bad)
-    check("error names the real mounted cart so a typo is obvious",
-          "seamtest" in (bad["error"] or ""), bad["error"])
+    check("error does not disclose the mounted cart's id",
+          "seamtest" not in (bad["error"] or ""), bad["error"])
     check("error does not leak results", bad["primary"] == [] and bad["missed"] == [], bad)
 
     print("\n5 - *** THE CLAIM WE MADE TO HUB: walk idx == multi_cart local_addr ***")
@@ -157,6 +157,62 @@ try:
     print("\n7 - cart_id wins over session_id when both are given")
     both = m.walk_associate_core("alpha", top_k=3, session_id=sid, cart_id="seamtest")
     check("cart_id takes precedence", both["cart"] != "session-cart", both["cart"])
+
+    print("\n8 - TWO CALLERS (NOVA): B names A's cart_id over MCP and gets nothing of A's")
+    # A (the in-process caller) mounted `seamtest` above. B is a network client: it can
+    # only reach the @mcp.tool wrapper, which has no cart_id parameter at all.
+    import inspect
+    check("the MCP walk_associate tool takes no cart_id",
+          "cart_id" not in inspect.signature(m.walk_associate).parameters,
+          list(inspect.signature(m.walk_associate).parameters))
+    b_sid = "caller-b"
+    m._sessions.pop(b_sid, None)
+    try:
+        out = m.walk_associate("alpha", session_id=b_sid, cart_id="seamtest")
+    except TypeError as e:
+        out = f"TypeError: {e}"
+    check("B gets none of A's passage text", not any(t in out for t in TEXTS), out[:300])
+    check("B's answer does not carry A's mount name", "seamtest" not in out, out[:300])
+    # And through the MCP layer itself, the way a network client calls it.
+    if hasattr(m.mcp, "call_tool"):
+        import asyncio
+        try:
+            res = asyncio.run(m.mcp.call_tool(
+                "walk_associate", {"query": "alpha", "session_id": b_sid, "cart_id": "seamtest"}))
+            wire = repr(res)
+        except Exception as e:                     # refused at validation: also fine
+            wire = f"{type(e).__name__}: {e}"
+        check("over MCP, B gets none of A's passage text", not any(t in wire for t in TEXTS), wire[:300])
+        # B supplied the id itself, so a validation error that echoes B's input discloses
+        # nothing. What B must not learn is anything of A's it did not send: the cart's
+        # path on disk or its passages.
+        check("over MCP, B learns nothing of A's mount (no cart path)", tmp not in wire, wire[:300])
+        check("over MCP, the cart_id argument is refused, not silently honoured",
+              "unexpected_keyword_argument" in wire or "Unexpected keyword" in wire, wire[:300])
+    else:
+        check("FastMCP call_tool reachable for the wire-level check", False, "no mcp.call_tool")
+
+    print("\n9 - a pooled-cart walk logs cart_id, not the query text")
+    import logging
+    seen = []
+
+    class _Cap(logging.Handler):
+        def emit(self, rec):
+            seen.append(rec.getMessage())
+    h = _Cap()
+    m.log.addHandler(h)
+    try:
+        m.walk_associate_core("gamma secret-query-marker", top_k=3, cart_id="seamtest")
+    finally:
+        m.log.removeHandler(h)
+    check("the walk logged something", bool(seen), seen)
+    check("no log line carries the query text",
+          not any("secret-query-marker" in x for x in seen), [x for x in seen if "secret" in x])
+    check("the log names the cart_id", any("seamtest" in x for x in seen), seen)
+    act = list(m._depot_activity)
+    check("the walk reached the activity log", any("cart:seamtest" in str(a) for a in act), act[-3:])
+    check("the activity log does not carry the query text",
+          not any("secret-query-marker" in str(a) for a in act), act[-3:])
 
 finally:
     try:
