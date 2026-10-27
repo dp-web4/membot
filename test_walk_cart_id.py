@@ -54,10 +54,14 @@ def fake_embed(text, *a, **kw):
 
 import membot_server as m                               # noqa: E402
 import multi_cart as mc                                 # noqa: E402
-import embed as _embed_mod                              # noqa: E402
+try:
+    import embed as _embed_mod                          # noqa: E402  (upstream's split-out module)
+except ImportError:                                     # this fork: embed_text lives in membot_server,
+    _embed_mod = None                                   # and multi_cart imports it from there lazily
 
 m.embed_text = fake_embed
-_embed_mod.embed_text = fake_embed
+if _embed_mod is not None:
+    _embed_mod.embed_text = fake_embed
 try:
     mc.embed_text = fake_embed
 except Exception:
