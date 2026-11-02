@@ -60,6 +60,7 @@ import uuid
 import logging
 import argparse
 import collections
+import contextlib
 import io
 import math
 import zipfile
@@ -351,9 +352,47 @@ def is_trusted_directory(path: str) -> bool:
 SESSION_TIMEOUT_SEC = 1800   # 30 minutes idle → session expires
 MAX_SESSIONS = 50            # Max concurrent sessions
 
-# A preliminary in-process boundary only. Other processes and writer entrypoints do not
-# participate; this does not make the NPZ/manifest pair crash-atomic.
+# Serializes sessions in this process. The cooperating file lock below also
+# serializes save_cartridge across processes for the same canonical paths.
+# Other writers still do not participate, and the pair is not crash-atomic.
 _cartridge_revision_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def _cooperating_cartridge_locks(paths):
+    """Serialize participating saves, not arbitrary writers or path replacement.
+
+    Persistent sibling lock files avoid unlink/recreate races among cooperating
+    callers. The sorted canonical set gives save-as a consistent lock order.
+    """
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("cross-process cartridge locking unavailable")
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise OSError("cross-process cartridge locking unavailable") from exc
+    locks = []
+    try:
+        for path in sorted({os.path.realpath(path) for path in paths if path}):
+            lock_path = path + ".membot.lock"
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            locks.append(fd)
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
+                    info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise OSError("unsafe cartridge lock file")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            named = os.stat(lock_path, follow_symlinks=False)
+            if (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino):
+                raise OSError("cartridge lock file changed during acquisition")
+        yield
+    finally:
+        for fd in reversed(locks):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
 
 def _new_session() -> dict:
     """Create a fresh session state dict."""
@@ -6115,7 +6154,21 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
     state = _get_session(session_id)
     with state["store_lock"]:
         with _cartridge_revision_lock:
-            return _save_cartridge_locked(name, session_id, state)
+            # Preserve existing error behavior for requests which cannot write.
+            if _server_config.get("read_only") or (state["cartridge_name"] is None and not name):
+                return _save_cartridge_locked(name, session_id, state)
+            try:
+                save_name = sanitize_name(name or state["cartridge_name"])
+            except ValueError:
+                return _save_cartridge_locked(name, session_id, state)
+            save_dir = os.path.join(BASE_DIR, "cartridges")
+            try:
+                os.makedirs(save_dir, exist_ok=True)
+                destination = os.path.join(save_dir, f"{save_name}.cart.npz")
+                with _cooperating_cartridge_locks((state.get("cartridge_path"), destination)):
+                    return _save_cartridge_locked(name, session_id, state)
+            except OSError as exc:
+                return f"Save error: cartridge lock unavailable; nothing saved ({exc})."
 
 
 def _preserved_cart_members(source: str, n_texts: int):
