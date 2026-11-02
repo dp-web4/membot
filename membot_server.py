@@ -220,7 +220,7 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
     }
     # Optional Pattern 0 v2 fields — only emit when caller supplied them so legacy
     # manifests stay minimal.
-    if briefing:
+    if briefing is not None:
         manifest["briefing"] = briefing
     if owner_id is not None:
         manifest["owner_id"] = owner_id
@@ -6020,11 +6020,21 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
     save_path = os.path.join(save_dir, f"{save_name}.cart.npz")
 
     try:
+        # Preserve explicitly supported authority metadata from the destination
+        # manifest. A malformed existing manifest is not an empty one: refusing
+        # here avoids silently replacing unreadable authority metadata.
+        manifest_path = save_path.rsplit(".", 1)[0] + "_manifest.json"
+        previous = load_manifest(save_path)
+        if os.path.exists(manifest_path) and not isinstance(previous, dict):
+            return "Save error: existing manifest is unreadable; authority metadata was not changed."
+        fields = ("briefing", "owner_id", "owner_perms", "group_perms", "world_perms",
+                  "group_id", "max_patterns", "cart_type")
+        retained = {key: previous[key] for key in fields if key in previous} if previous else {}
         save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"))
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
 
         # Save integrity manifest
-        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]))
+        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]), **retained)
         state["modified"] = False
 
         # Also save brain weights if GPU is active

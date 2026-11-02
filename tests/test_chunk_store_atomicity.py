@@ -3,6 +3,7 @@
 These tests use only synthetic session state and temporary cartridges. They do
 not connect to an embedder, an MCP server, or a remote persistence service.
 """
+import json
 import os
 import sys
 import tempfile
@@ -191,6 +192,49 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaises(ValueError):
                 M.save_as_npz(os.path.join(temp, "bad.cart.npz"), None, ["has text"])
+
+    def test_save_preserves_manifest_authority_fields(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            fields = {"briefing": "synthetic", "owner_id": "owner-1", "owner_perms": "rwda",
+                      "group_perms": "r", "world_perms": "", "group_id": "group-1",
+                      "max_patterns": 99, "cart_type": "agent-memory"}
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            manifest = M.load_manifest(path)
+            manifest.update(fields)
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            M._sessions.pop(self.sid)
+            mounted = M.mount_cartridge("test", session_id=self.sid)
+            self.assertNotIn("SECURITY", mounted)
+            self.assertEqual(M._get_session(self.sid)["world_perms"], "")
+            M.memory_store("another", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            saved = M.load_manifest(path)
+            self.assertEqual({key: saved.get(key) for key in fields}, fields)
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            self.assertEqual(M._get_session(self.sid)["world_perms"], "")
+
+    def test_save_refuses_unreadable_existing_manifest_before_cart_write(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(path, "rb") as stream:
+                before = stream.read()
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                stream.write("not-json")
+            M.memory_store("new data", session_id=self.sid)
+            self.assertIn("existing manifest is unreadable", M.save_cartridge(session_id=self.sid))
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
 
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
