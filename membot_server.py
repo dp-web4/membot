@@ -370,7 +370,7 @@ def _cooperating_cartridge_locks(paths):
     Persistent sibling lock files avoid unlink/recreate races among cooperating
     callers. The sorted canonical set gives save-as a consistent lock order.
     """
-    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
         raise OSError("cross-process cartridge locking unavailable")
     try:
         import fcntl
@@ -381,7 +381,7 @@ def _cooperating_cartridge_locks(paths):
     try:
         for path in sorted({os.path.realpath(path) for path in paths if path}):
             lock_path = path + ".membot.lock"
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             locks.append(fd)
             info = os.fstat(fd)
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
