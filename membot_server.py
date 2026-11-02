@@ -62,7 +62,6 @@ import argparse
 import collections
 import io
 import math
-import tempfile
 import zipfile
 import numpy as np
 
@@ -1530,7 +1529,7 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern_meta=None,
                 *, version="mcp-v3", extra_members=None):
-    """Save cartridge in safe NPZ format (no pickle, no code execution)."""
+    """Write a cartridge; legacy object arrays are not safe to load from untrusted inputs."""
     if embeddings is None:
         if texts:
             raise ValueError("cannot save nonempty passages without embeddings")
@@ -1548,30 +1547,66 @@ def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern
     # Write to an owned same-directory temp, preserving validated raw auxiliary
     # NPY members without unpickling them. This only publishes the NPZ; its
     # sidecar still needs a recoverable cross-file transaction.
-    prior_mode = None
+    existing = None
+    prior_attrs = None
     if os.path.lexists(path):
         existing = os.lstat(path)
         if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
             raise ValueError("refusing to replace a non-regular or multiply linked cartridge")
         if hasattr(os, "geteuid") and existing.st_uid != os.geteuid():
             raise ValueError("refusing to replace a cartridge owned by another user")
-        if hasattr(os, "listxattr") and os.listxattr(path, follow_symlinks=False):
-            raise ValueError("refusing to discard cartridge extended attributes")
-        prior_mode = stat.S_IMODE(existing.st_mode)
-    fd, tmp = tempfile.mkstemp(prefix=".membot-save-", suffix=".npz", dir=os.path.dirname(path) or ".")
-    try:
+        if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr", "removexattr")):
+            raise ValueError("cannot verify cartridge extended attributes on this platform")
+        prior_attrs = {key: os.getxattr(path, key, follow_symlinks=False)
+                       for key in os.listxattr(path, follow_symlinks=False)}
+    # O_EXCL prevents reuse of an attacker-created name, and new files use 0666
+    # filtered by the process umask, as before. A .tmp
+    # suffix keeps in-progress files out of cartridge discovery.
+    for _ in range(8):
+        tmp = os.path.join(os.path.dirname(path) or ".", f".membot-save-{uuid.uuid4().hex}.tmp")
         try:
-            if prior_mode is not None:
-                os.fchmod(fd, prior_mode)
-        finally:
-            os.close(fd)
-        np.savez_compressed(tmp, **fields)
+            # Existing private cartridges must never expose an empty temporary
+            # inode at a looser mode before fchmod; already-open readers keep
+            # access even after its mode is tightened.
+            fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                         0o600 if existing is not None else 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError("could not reserve a cartridge temporary file")
+    try:
+        if existing is not None:
+            if os.fstat(fd).st_gid != existing.st_gid:
+                os.fchown(fd, -1, existing.st_gid)
+        # Keep the original descriptor open: the temp stays private while data
+        # is written and zip operations cannot be redirected via its pathname.
+        with os.fdopen(os.dup(fd), "wb") as out:
+            np.savez_compressed(out, **fields)
         if extra_members:
-            with zipfile.ZipFile(tmp, "a", compression=zipfile.ZIP_DEFLATED) as cart:
-                for name, payload in extra_members.items():
-                    cart.writestr(name, payload)
+            with os.fdopen(os.dup(fd), "r+b") as out:
+                with zipfile.ZipFile(out, "a", compression=zipfile.ZIP_DEFLATED) as cart:
+                    for name, payload in extra_members.items():
+                        cart.writestr(name, payload)
+        if prior_attrs is not None:
+            current_attrs = set(os.listxattr(fd))
+            for key in current_attrs - set(prior_attrs):
+                os.removexattr(fd, key)
+            for key, value in prior_attrs.items():
+                if key not in current_attrs or os.getxattr(fd, key) != value:
+                    os.setxattr(fd, key, value)
+            os.fchmod(fd, stat.S_IMODE(existing.st_mode))
+            copied = {key: os.getxattr(fd, key) for key in os.listxattr(fd)}
+            saved = os.fstat(fd)
+            if (copied != prior_attrs or saved.st_uid != existing.st_uid or saved.st_gid != existing.st_gid
+                    or stat.S_IMODE(saved.st_mode) != stat.S_IMODE(existing.st_mode)):
+                raise ValueError("cannot preserve cartridge ownership, mode and extended attributes")
+        by_name, by_fd = os.lstat(tmp), os.fstat(fd)
+        if (by_name.st_dev, by_name.st_ino) != (by_fd.st_dev, by_fd.st_ino):
+            raise ValueError("cartridge temporary file changed before publication")
         os.replace(tmp, path)
     finally:
+        os.close(fd)
         if os.path.exists(tmp):
             os.unlink(tmp)
 

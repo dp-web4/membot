@@ -443,6 +443,88 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             with open(link, "rb") as stream:
                 self.assertEqual(stream.read(), before)
 
+    @unittest.skipUnless(all(hasattr(os, name) for name in ("setxattr", "getxattr")), "xattrs unavailable")
+    def test_save_preserves_existing_extended_attributes(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            try:
+                os.setxattr(path, "user.membot_test", b"synthetic")
+            except OSError as exc:
+                self.skipTest(f"user xattrs unavailable: {exc}")
+            M.memory_store("new", session_id=self.sid)
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(result.startswith("Saved"), result)
+            self.assertEqual(os.getxattr(path, "user.membot_test"), b"synthetic")
+
+    @unittest.skipUnless(all(hasattr(os, name) for name in ("setxattr", "getxattr")), "xattrs unavailable")
+    def test_xattr_copy_failure_does_not_replace_existing_cartridge(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            try:
+                os.setxattr(path, "user.membot_test", b"synthetic")
+            except OSError as exc:
+                self.skipTest(f"user xattrs unavailable: {exc}")
+            with open(path, "rb") as stream:
+                before = stream.read()
+            M.memory_store("new", session_id=self.sid)
+            with patch.object(M.os, "setxattr", side_effect=PermissionError("synthetic")) as setter:
+                result = M.save_cartridge(session_id=self.sid)
+            self.assertFalse(result.startswith("Saved"), result)
+            setter.assert_called()
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+            self.assertEqual(os.getxattr(path, "user.membot_test"), b"synthetic")
+            self.assertFalse(any(name.startswith(".membot-save-") for name in os.listdir(os.path.dirname(path))))
+
+    def test_new_save_obeys_umask_and_temporary_file_is_not_discoverable(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            save_npz = np.savez_compressed
+            discovered = []
+
+            def inspect_then_save(*args, **kwargs):
+                discovered.extend(cart["name"] for cart in M.find_cartridges())
+                return save_npz(*args, **kwargs)
+
+            old_mask = os.umask(0o022)
+            try:
+                with patch.object(M.np, "savez_compressed", side_effect=inspect_then_save):
+                    result = M.save_cartridge(session_id=self.sid)
+            finally:
+                os.umask(old_mask)
+            self.assertTrue(result.startswith("Saved"), result)
+            self.assertFalse(any(name.startswith(".membot-save-") for name in discovered), discovered)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
+
+    def test_in_place_temp_stays_private_until_data_is_written(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            os.chmod(path, 0o644)
+            M.memory_store("next", session_id=self.sid)
+            writer = np.savez_compressed
+            observed = []
+
+            def inspect_then_save(stream, **kwargs):
+                observed.append(stat.S_IMODE(os.fstat(stream.fileno()).st_mode))
+                return writer(stream, **kwargs)
+
+            with patch.object(M.np, "savez_compressed", side_effect=inspect_then_save):
+                self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            self.assertEqual(observed, [0o600])
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
+
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
