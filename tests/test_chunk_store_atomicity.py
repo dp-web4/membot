@@ -169,6 +169,44 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
         self.assertIn("SECURITY", result)
         self.assertIsNone(self.state["cartridge_name"])
 
+    def test_manifest_detects_group_identity_tampering(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store(LONG, session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            loaded = M.load_cartridge_safe(path)
+            changed = [dict(entry) for entry in loaded["per_pattern_meta"]]
+            changed[0]["memory_group_id"] = "tampered-group"
+            # Only identity metadata changes; embeddings and passage count are identical.
+            M.save_as_npz(path, loaded["embeddings"], loaded["texts"], changed)
+            tampered = M.load_cartridge_safe(path)
+            ok, detail = M.verify_manifest(path, tampered["embeddings"], len(tampered["texts"]))
+            self.assertFalse(ok, detail)
+
+    def test_two_sessions_must_not_silently_overwrite_each_others_groups(self):
+        other_sid = "chunk-atomicity-other"
+        self.addCleanup(M._sessions.pop, other_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            self.assertIn("Stored memory #", M.memory_store("seed", session_id=self.sid))
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M._sessions.pop(self.sid)
+            first_mount = M.mount_cartridge("test", session_id=self.sid)
+            second_mount = M.mount_cartridge("test", session_id=other_sid)
+            self.assertNotIn("SECURITY", first_mount)
+            self.assertNotIn("SECURITY", second_mount)
+            self.assertIn("Stored memory #", M.memory_store(LONG, tags="first", session_id=self.sid))
+            self.assertIn("Stored memory #", M.memory_store(LONG, tags="second", session_id=other_sid))
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            second_save = M.save_cartridge(session_id=other_sid)
+            loaded = M.load_cartridge_safe(os.path.join(temp, "cartridges", "test.cart.npz"))
+            all_text = "\n".join(loaded["texts"])
+            # Either fail the stale save visibly, or retain both complete groups.
+            self.assertTrue(not second_save.startswith("Saved") or
+                            ("[first]" in all_text and "[second]" in all_text), second_save)
+
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
         release = threading.Event()
