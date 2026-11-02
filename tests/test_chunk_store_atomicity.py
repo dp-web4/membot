@@ -169,6 +169,29 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
         self.assertIn("SECURITY", result)
         self.assertIsNone(self.state["cartridge_name"])
 
+    def test_empty_save_and_legacy_empty_save_both_remount(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            fresh = M.load_cartridge_safe(path)
+            self.assertEqual(len(fresh["embeddings"]), 0)
+            # Recreate the exact legacy shape written when embeddings was None.
+            np.savez_compressed(path, embeddings=None, passages=np.array([], dtype=object),
+                                version="mcp-v3")
+            legacy = M.load_cartridge_safe(path)
+            self.assertEqual(len(legacy["embeddings"]), 0)
+            M._sessions.pop(self.sid)
+            result = M.mount_cartridge("test", session_id=self.sid)
+            self.assertNotIn("SECURITY", result)
+            self.assertIn("Stored memory #", M.memory_store("after restart", session_id=self.sid))
+
+    def test_missing_embeddings_for_nonempty_cartridge_cannot_be_saved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(ValueError):
+                M.save_as_npz(os.path.join(temp, "bad.cart.npz"), None, ["has text"])
+
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):

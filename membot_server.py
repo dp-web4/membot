@@ -1367,6 +1367,14 @@ def load_npz_cartridge(path: str) -> dict:
     else:
         result["texts"] = []
 
+    # Older empty saves serialized None as a zero-dimensional object array.
+    # Normalize that exact legacy case only; do not conceal malformed nonempty
+    # cartridges as empty embeddings.
+    emb = result["embeddings"]
+    if (not result["texts"] and isinstance(emb, np.ndarray) and emb.ndim == 0
+            and emb.dtype == object and emb.item() is None):
+        result["embeddings"] = np.empty((0, 0), dtype=np.float32)
+
     # Load hippocampus metadata if present (mcp-v4+)
     if "hippocampus" in data:
         raw_hippo = data["hippocampus"]
@@ -1511,6 +1519,10 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern_meta=None):
     """Save cartridge in safe NPZ format (no pickle, no code execution)."""
+    if embeddings is None:
+        if texts:
+            raise ValueError("cannot save nonempty passages without embeddings")
+        embeddings = np.empty((0, 0), dtype=np.float32)
     compressed_texts = []
     for t in texts:
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
