@@ -157,6 +157,15 @@ def compute_fingerprint(embeddings: np.ndarray, n_texts: int) -> str:
     return h.hexdigest()[:16]
 
 
+def _cartridge_sha256(path: str) -> str:
+    """Hash all cartridge bytes for corruption detection, not authenticity."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 # Pattern 0 v2 permission helpers.
 # Permission semantics from spec docs/RFC/pattern-0-v2-spec.md:
 #   r = read (search the cart)        bit 0 = 1
@@ -221,6 +230,10 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
         "version": version,
         "count": n_texts,
         "fingerprint": compute_fingerprint(embeddings, n_texts),
+        # The historical fingerprint samples only first/last embeddings and
+        # count. Keep it for compatibility, but bind newly written manifests
+        # to the entire cartridge, including text and per-pattern metadata.
+        "content_sha256": _cartridge_sha256(cart_path),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     # Optional Pattern 0 v2 fields — only emit when caller supplied them so legacy
@@ -286,6 +299,13 @@ def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tup
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
 
+        if "content_sha256" in manifest:
+            expected_content = manifest["content_sha256"]
+            if not isinstance(expected_content, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_content):
+                return False, "invalid content_sha256 in manifest"
+            if _cartridge_sha256(cart_path) != expected_content:
+                return False, "CONTENT SHA256 MISMATCH"
+
         expected_fp = manifest.get("fingerprint", "")
         actual_fp = compute_fingerprint(embeddings, n_texts)
 
@@ -296,7 +316,9 @@ def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tup
         if expected_count != n_texts:
             return False, f"COUNT MISMATCH: expected {expected_count}, got {n_texts}"
 
-        return True, f"verified ({actual_fp})"
+        if "content_sha256" in manifest:
+            return True, f"whole-cartridge checksum verified; legacy fingerprint {actual_fp} (not authenticated)"
+        return True, f"legacy sampled fingerprint only ({actual_fp}); content and metadata not fully checked"
     except Exception as e:
         return False, f"manifest read error: {e}"
 
@@ -6150,7 +6172,7 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
                   "group_id", "max_patterns", "cart_type")
         if previous:
             unknown = set(previous) - set(fields) - {
-                "version", "count", "fingerprint", "timestamp", "has_hippocampus", "rebuilt_by"}
+                "version", "count", "fingerprint", "content_sha256", "timestamp", "has_hippocampus", "rebuilt_by"}
             if unknown:
                 return "Save error: unsupported manifest fields; refusing to discard their meaning."
             if "has_hippocampus" in previous and type(previous["has_hippocampus"]) is not bool:

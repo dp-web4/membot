@@ -190,6 +190,14 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                                 version="mcp-v3")
             legacy = M.load_cartridge_safe(path)
             self.assertEqual(legacy["embeddings"].shape, (0, 768))
+            # Rewriting an archive under a new manifest is detected. A genuinely
+            # legacy sidecar has no whole-content digest and uses the old check.
+            self.assertFalse(M.verify_manifest(path, legacy["embeddings"], 0)[0])
+            sidecar = path.rsplit(".", 1)[0] + "_manifest.json"
+            manifest = M.load_manifest(path)
+            del manifest["content_sha256"]
+            with open(sidecar, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
             M._sessions.pop(self.sid)
             result = M.mount_cartridge("test", session_id=self.sid)
             self.assertNotIn("SECURITY", result)
@@ -539,6 +547,53 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             tampered = M.load_cartridge_safe(path)
             ok, detail = M.verify_manifest(path, tampered["embeddings"], len(tampered["texts"]))
             self.assertFalse(ok, detail)
+
+    def test_manifest_covers_text_and_middle_embedding_not_just_group_metadata(self):
+        for mutation in ("text", "middle_embedding"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(M, "BASE_DIR", temp), patch.object(M, "embed_text", fake_embed):
+                self.setUp_fresh_state_for_digest()
+                M.memory_store(LONG, session_id=self.sid)
+                self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+                path = os.path.join(temp, "cartridges", "test.cart.npz")
+                loaded = M.load_cartridge_safe(path)
+                self.assertGreater(len(loaded["texts"]), 2)
+                self.assertTrue(M.verify_manifest(path, loaded["embeddings"], len(loaded["texts"]))[0])
+                if mutation == "text":
+                    loaded["texts"][1] += " modified"
+                else:
+                    loaded["embeddings"][1, 0] += 1
+                M.save_as_npz(path, loaded["embeddings"], loaded["texts"], loaded["per_pattern_meta"])
+                self.assertFalse(M.verify_manifest(path, loaded["embeddings"], len(loaded["texts"]))[0])
+
+    def setUp_fresh_state_for_digest(self):
+        M._sessions.pop(self.sid, None)
+        self.state = M._get_session(self.sid)
+        self.state["cartridge_name"] = "test"
+
+    def test_legacy_and_malformed_content_digests_are_distinguished(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            sidecar = path.rsplit(".", 1)[0] + "_manifest.json"
+            loaded = M.load_cartridge_safe(path)
+            manifest = M.load_manifest(path)
+            self.assertRegex(manifest["content_sha256"], r"^[0-9a-f]{64}$")
+            ok, detail = M.verify_manifest(path, loaded["embeddings"], len(loaded["texts"]))
+            self.assertTrue(ok)
+            self.assertIn("not authenticated", detail)
+            manifest["content_sha256"] = None
+            with open(sidecar, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            self.assertFalse(M.verify_manifest(path, loaded["embeddings"], len(loaded["texts"]))[0])
+            del manifest["content_sha256"]  # historical manifest: weaker compatibility check
+            with open(sidecar, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            ok, detail = M.verify_manifest(path, loaded["embeddings"], len(loaded["texts"]))
+            self.assertTrue(ok)
+            self.assertIn("legacy sampled fingerprint only", detail)
 
     def test_two_sessions_must_not_silently_overwrite_each_others_groups(self):
         other_sid = "chunk-atomicity-other"
