@@ -920,6 +920,38 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertEqual(len(results), 1)
             self.assertIn("not started", results[0].lower())
             self.assertEqual(M._cartridge_pair_revision(path), before)
+            with M._cooperating_cartridge_locks((path,)):
+                pass  # a later writer can acquire after the holder exits
+
+    @unittest.skipUnless(os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(), "requires POSIX fork")
+    def test_lock_timeout_releases_earlier_path_locks(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "_CARTRIDGE_LOCK_TIMEOUT_S", 0.1):
+            first, second = os.path.join(temp, "a"), os.path.join(temp, "b")
+            context = multiprocessing.get_context("fork")
+            ready, release = context.Event(), context.Event()
+
+            def hold_second():
+                with M._cooperating_cartridge_locks((second,)):
+                    ready.set()
+                    release.wait(5)
+
+            holder = context.Process(target=hold_second)
+            holder.start()
+            try:
+                self.assertTrue(ready.wait(5), "synthetic holder did not acquire the lock")
+                with self.assertRaises(M._CartridgeLockTimeout):
+                    with M._cooperating_cartridge_locks((first, second)):
+                        self.fail("contended lock unexpectedly acquired")
+                # The earlier lock must not remain held after the later timeout.
+                with M._cooperating_cartridge_locks((first,)):
+                    pass
+            finally:
+                release.set()
+                holder.join(5)
+                if holder.is_alive():
+                    holder.terminate()
+                    holder.join(5)
+            self.assertEqual(holder.exitcode, 0)
 
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
