@@ -18,6 +18,9 @@ import urllib.error
 
 MEMBOT_URL = os.environ.get("MEMBOT_URL", "http://localhost:8000")
 TEST_CARTRIDGE = "fleet-test-ephemeral"
+# All mounts/stores/searches run in a dedicated session slot so the suite never
+# displaces a production cartridge (e.g. thor-memory) from the 'default' slot.
+TEST_SESSION = "fleet-test"
 
 
 def api(method, path, data=None, timeout=10):
@@ -25,6 +28,7 @@ def api(method, path, data=None, timeout=10):
     url = f"{MEMBOT_URL}{path}"
     req = urllib.request.Request(url, method=method)
     if data:
+        data = {"session_id": TEST_SESSION, **data}
         req.data = json.dumps(data).encode()
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -171,9 +175,11 @@ class TestResourceConstraints(unittest.TestCase):
 
     def test_no_sentence_transformers_on_sprout(self):
         """On Sprout (ARM64 Jetson), sentence-transformers should NOT be loaded."""
-        import platform
-        if platform.machine() != "aarch64":
-            self.skipTest("Not on ARM64 — sentence-transformers check not applicable")
+        import socket
+        # Gate on hostname, not arch: thor is also aarch64 and legitimately runs
+        # SentenceTransformer (MEMBOT_EMBED_BACKEND=auto prefers Ollama when up).
+        if "sprout" not in socket.gethostname().lower():
+            self.skipTest("Not on Sprout — sentence-transformers check not applicable")
 
         # Check if sentence_transformers is importable (it shouldn't be on Sprout)
         try:

@@ -88,7 +88,7 @@ def main():
         check("text unchanged", st["texts"][0] == "[note] a short thing worth keeping",
               repr(st["texts"][0]))
         check("no part label", "(part " not in st["texts"][0])
-        check("reply names the idx", "(idx 0)" in out, out)
+        check("reply names the idx", "(idx:0)" in out, out)
 
         print("\n2. long store — several passages")
         sid, st = fresh_session()
@@ -98,7 +98,7 @@ def main():
         check("every part labelled", all(f"(part {i+1}/{n})" in st["texts"][i] for i in range(n)),
               st["texts"][0][:80])
         check("tags on every part", all(t.startswith("[arc,ft09] ") for t in st["texts"]))
-        check("reply names the range", f"idx 0-{n-1}" in out, out)
+        check("reply names the range", f"idx:0-{n-1}" in out, out)
         check("reply names the count", f"{n} parts" in out, out)
         check("overlap is real", M.CHUNK_STORE_OVERLAP > 0
               and len(set(st["texts"])) == n)
@@ -131,16 +131,14 @@ def main():
         check("reported as duplicate", out.startswith("Duplicate"), out[:80])
         check("stored nothing", len(st["texts"]) == before, f"{len(st['texts'])} vs {before}")
 
-        # PARTIAL dedup: one piece missing (a tombstoned passage, or a cart rebuilt short)
-        # and the same note re-stored. Only the gap refills, and the reply says how many
-        # were already there.
-        gap = st["texts"].pop(1)
-        st["embeddings"] = np.delete(st["embeddings"], 1, axis=0)
-        st["binary_corpus"] = np.delete(st["binary_corpus"], 1, axis=0)
+        # Tombstone the addressed slot without renumbering subsequent handles.
+        # A partial match must not borrow pieces from a different logical memory.
+        st["texts"][1] = "[tombstone]"
         out = M.memory_store(LONG, tags="arc,ft09", session_id=sid)
-        check("refilled exactly the gap", st["texts"][-1] == gap, st["texts"][-1][:60])
-        check("stored one piece", len(st["texts"]) == before, f"{len(st['texts'])} vs {before}")
-        check("reply counts the ones already stored", f"{before - 1} already stored" in out, out)
+        check("tombstone remains at its old index", st["texts"][1] == "[tombstone]")
+        check("stored a complete new group", len(st["texts"]) == before * 2,
+              f"{len(st['texts'])} vs {before * 2}")
+        check("receipt identifies the new group", "group:" in out, out)
 
         print("\n6. no room for every piece — stores none")
         sid2, st2 = fresh_session("test-full")
@@ -183,12 +181,15 @@ def main():
         M.embed_text = real_embed
 
     print("\n9. ranking (live embedder)")
-    try:
-        M.embed_text("probe", prefix="search_query")
-        live = True
-    except Exception as e:
-        live = False
-        print(f"  SKIP  no embedder reachable ({type(e).__name__}: {str(e)[:60]})")
+    live = False
+    if os.environ.get("MEMBOT_SKIP_LIVE_TEST"):
+        print("  SKIP  live embedder test disabled")
+    else:
+        try:
+            M.embed_text("probe", prefix="search_query")
+            live = True
+        except Exception as e:
+            print(f"  SKIP  no embedder reachable ({type(e).__name__}: {str(e)[:60]})")
     if live:
         sid4, st4 = fresh_session("test-rank")
         # The fact sits ~450 words in, so it lands in part 2 and NOT in part 1 (300-word

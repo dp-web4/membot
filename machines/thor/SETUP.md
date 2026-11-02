@@ -53,18 +53,30 @@ This installs:
 
 ## Server Configuration
 
-Thor runs membot as a background process (not systemd service yet). Started manually via:
+Thor runs membot as a **systemd user service** (`~/.config/systemd/user/membot.service`, enabled + lingering), upgraded 2026-09-13 to current main:
 
 ```bash
-cd ~/ai-workspace/membot
-.venv/bin/python membot_server.py --transport http --port 8000 --writable --mount ~/.snarc/membot/cartridges/sage > membot.log 2>&1 &
+systemctl --user status membot        # state
+systemctl --user restart membot       # after code/venv changes
 ```
 
-Configuration:
-- **Port**: 8000 (standard HTTP)
+Unit configuration:
+- **ExecStart**: `.venv/bin/python membot_server.py --transport http --host 127.0.0.1 --port 8000 --writable --mount thor-memory`
+- **Environment**: `MEMBOT_EMBED_BACKEND=auto` (prefers Ollama `nomic-embed-text`, ~2GB less RAM; falls back to SentenceTransformer in the venv)
+- **Port**: 8000 (loopback HTTP)
 - **Writable mode**: enabled (store + save operations allowed)
-- **Transport**: HTTP REST API
-- **Auto-mount**: sage cartridge (shared with SAGE instances)
+- **Auto-mount**: thor-memory cartridge (engram dual-write recall)
+
+**Post-restart gotcha (observed 2026-09-13):** the startup `--mount` attaches the cart before the embed backend finishes warming — status shows `hamming-only` and searches skip embeddings until you re-`POST /api/mount` once (embeddings then attach, mode flips to `hamming+embedding`). One remount after boot is the current warm-up ritual. Hamming-only recall still works in the meantime, just weaker ranking.
+
+## Multi-cartridge
+
+Current membot has two coexisting layers:
+
+- **Multi-cart pool** — MCP tools only (`multi_mount` / `multi_search` / `multi_list`, spec `docs/RFC/multi-cart-query-spec.md`); one process holds many carts and queries across them with `scope_mode` ranking. Verified on thor: `tests/test_multi_cart.py` (standalone, all 9 pass).
+- **REST layer** (`/api/mount`, `/api/search`, …) — one cart per **session slot**. Passing a distinct `session_id` in the request body mounts that cart in its own slot without displacing the `default` session's cart. Verified: thor-memory on `default` + attention-is-all-you-need on `kimi-test`, both searchable simultaneously.
+
+REST consumers coexist via session slots: engram/kimi-style clients that pass their own `session_id` never displace each other. (The kimi-memory adapter currently does not pass one — it shares `default`; see shared-context/kimi-memory.)
 
 ## Verification
 
@@ -134,17 +146,17 @@ Thor's 122GB RAM provides massive headroom for:
 ## Integration Status
 
 **✓ Working**:
-- Membot HTTP server running on port 8000
-- REST API responding (`/api/status`, `/api/search`, `/api/store`)
-- SentenceTransformer embeddings loaded (768-dim)
-- SNARC rebuilt with membot-bridge (dual-write ready)
-- Fleet health tests passing
+- Membot HTTP server running on port 8000 (systemd user unit, current main as of 2026-09-13)
+- REST API responding (`/api/status`, `/api/search`, `/api/store`, `/api/mount` with per-session slots)
+- Ollama embedding backend active (`nomic-embed-text`, hamming+embedding mode after warm remount)
+- thor-memory cartridge mounted (240 memories, integrity verified)
+- Multi-cart layer verified (`tests/test_multi_cart.py`, 9/9)
+- Fleet health suite green on thor (9 passed, 1 sprout-only skip)
 
 **⏳ Pending**:
-- Systemd service file (currently manual start)
 - SAGE IRP integration testing
 - Dual-write experiment data collection
-- Cartridge auto-mount on restart
+- Startup `--mount` embedding attachment (currently needs one manual remount after boot)
 
 ## Experiment Participation
 
@@ -186,11 +198,10 @@ All tracks use Claude Code which triggers SNARC hooks. Membot automatically capt
 
 This is optional — embedding-only search works fine without it.
 
-**Systemd Service**: Convert to proper systemd service like Sprout's `membot-sprout.service` for auto-start on boot and proper resource management.
+**Systemd Service**: ✅ Done (2026-08-29 unit, `membot.service`); embedding-only search works fine without the lattice.
 
 ---
 
-**Setup Date**: 2026-03-26
-**SNARC Version**: 0.3.0 (membot-bridge integrated)
-**Membot Version**: Latest (REST API)
-**Status**: Operational, experiment-ready
+**Setup Date**: 2026-03-26 · **Last verified current**: 2026-09-13 (kimi-code: fastmcp 4 reinstall, systemd restart, multi-cart + session-slot verification, fleet health green)
+**Membot Version**: main @ 6688021 (multi-cart + membox + federate layers present)
+**Status**: Operational, current, experiment-ready
