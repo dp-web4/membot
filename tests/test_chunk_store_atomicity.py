@@ -177,12 +177,17 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
             path = os.path.join(temp, "cartridges", "test.cart.npz")
             fresh = M.load_cartridge_safe(path)
-            self.assertEqual(len(fresh["embeddings"]), 0)
+            self.assertEqual(fresh["embeddings"].shape, (0, 768))
+            with patch.object(M, "_mempack_load_for_mutation", return_value=(
+                    {}, path, fresh["embeddings"], [])), \
+                    patch.object(M, "_mempack_repack_and_persist", return_value=1) as persist:
+                M._mempack_append_blobless("synthetic", "new", new_embedding=fake_embed("new"))
+                self.assertEqual(persist.call_args.args[2].shape, (1, 768))
             # Recreate the exact legacy shape written when embeddings was None.
             np.savez_compressed(path, embeddings=None, passages=np.array([], dtype=object),
                                 version="mcp-v3")
             legacy = M.load_cartridge_safe(path)
-            self.assertEqual(len(legacy["embeddings"]), 0)
+            self.assertEqual(legacy["embeddings"].shape, (0, 768))
             M._sessions.pop(self.sid)
             result = M.mount_cartridge("test", session_id=self.sid)
             self.assertNotIn("SECURITY", result)
@@ -235,6 +240,75 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertIn("existing manifest is unreadable", M.save_cartridge(session_id=self.sid))
             with open(path, "rb") as stream:
                 self.assertEqual(stream.read(), before)
+
+    def test_invalid_manifest_values_refuse_before_cart_write(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(path, "rb") as stream:
+                before = stream.read()
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            manifest = M.load_manifest(path)
+            manifest["max_patterns"] = "unlimited"
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            M.memory_store("changed", session_id=self.sid)
+            self.assertFalse(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+
+    def test_save_as_carries_source_authority_and_refuses_existing_other_cart(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("private", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            source = os.path.join(temp, "cartridges", "test.cart.npz")
+            fields = {"owner_id": "owner-1", "world_perms": "", "cart_type": "agent-memory"}
+            manifest = M.load_manifest(source)
+            manifest.update(fields)
+            with open(source.rsplit(".", 1)[0] + "_manifest.json", "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            self.assertTrue(M.save_cartridge("copy", session_id=self.sid).startswith("Saved"))
+            copy = os.path.join(temp, "cartridges", "copy.cart.npz")
+            copy_manifest = M.load_manifest(copy)
+            self.assertEqual({key: copy_manifest.get(key) for key in fields}, fields)
+            copy_manifest.update({"owner_id": "other", "world_perms": "r"})
+            with open(copy.rsplit(".", 1)[0] + "_manifest.json", "w", encoding="utf-8") as stream:
+                json.dump(copy_manifest, stream)
+            with open(copy, "rb") as stream:
+                before = stream.read()
+            result = M.save_cartridge("copy", session_id=self.sid)
+            self.assertFalse(result.startswith("Saved"), result)
+            with open(copy, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+
+    def test_save_as_refuses_stale_source_authority_and_unknown_manifest_fields(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("private", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            source = os.path.join(temp, "cartridges", "test.cart.npz")
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            manifest_path = source.rsplit(".", 1)[0] + "_manifest.json"
+            manifest = M.load_manifest(source)
+            manifest["world_perms"] = ""  # Changed after this session mounted world-readable state.
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            self.assertFalse(M.save_cartridge("copy", session_id=self.sid).startswith("Saved"))
+            self.assertFalse(os.path.exists(os.path.join(temp, "cartridges", "copy.cart.npz")))
+            manifest["world_perms"] = "r"
+            manifest["future_policy"] = {"share": False}
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            self.assertFalse(M.save_cartridge("copy", session_id=self.sid).startswith("Saved"))
+            self.assertFalse(os.path.exists(os.path.join(temp, "cartridges", "copy.cart.npz")))
 
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \

@@ -1373,7 +1373,7 @@ def load_npz_cartridge(path: str) -> dict:
     emb = result["embeddings"]
     if (not result["texts"] and isinstance(emb, np.ndarray) and emb.ndim == 0
             and emb.dtype == object and emb.item() is None):
-        result["embeddings"] = np.empty((0, 0), dtype=np.float32)
+        result["embeddings"] = np.empty((0, 768), dtype=np.float32)
 
     # Load hippocampus metadata if present (mcp-v4+)
     if "hippocampus" in data:
@@ -1522,7 +1522,7 @@ def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern
     if embeddings is None:
         if texts:
             raise ValueError("cannot save nonempty passages without embeddings")
-        embeddings = np.empty((0, 0), dtype=np.float32)
+        embeddings = np.empty((0, 768), dtype=np.float32)
     compressed_texts = []
     for t in texts:
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
@@ -6020,22 +6020,57 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
     save_path = os.path.join(save_dir, f"{save_name}.cart.npz")
 
     try:
-        # Preserve explicitly supported authority metadata from the destination
-        # manifest. A malformed existing manifest is not an empty one: refusing
-        # here avoids silently replacing unreadable authority metadata.
-        manifest_path = save_path.rsplit(".", 1)[0] + "_manifest.json"
-        previous = load_manifest(save_path)
-        if os.path.exists(manifest_path) and not isinstance(previous, dict):
+        # A different existing destination is not this mounted cartridge: do
+        # not put its authority on the source contents, or overwrite it.
+        source = state.get("cartridge_path")
+        in_place = bool(source and os.path.realpath(source) == os.path.realpath(save_path))
+        if not in_place and (os.path.exists(save_path) or
+                             os.path.exists(save_path.rsplit(".", 1)[0] + "_manifest.json")):
+            return "Save error: destination already exists and is not the mounted cartridge."
+
+        # For an in-place save use the destination's metadata. For a new
+        # copy use the mounted source's authority, not the destination default.
+        metadata_path = save_path if in_place else source
+        manifest_path = metadata_path.rsplit(".", 1)[0] + "_manifest.json" if metadata_path else None
+        previous = load_manifest(metadata_path) if metadata_path else None
+        if manifest_path and os.path.exists(manifest_path) and not isinstance(previous, dict):
             return "Save error: existing manifest is unreadable; authority metadata was not changed."
         fields = ("briefing", "owner_id", "owner_perms", "group_perms", "world_perms",
                   "group_id", "max_patterns", "cart_type")
-        retained = {key: previous[key] for key in fields if key in previous} if previous else {}
+        if previous:
+            unknown = set(previous) - set(fields) - {"version", "count", "fingerprint", "timestamp"}
+            if unknown:
+                return "Save error: unsupported manifest fields; refusing to discard their meaning."
+            if ("max_patterns" in previous and
+                    (type(previous["max_patterns"]) is not int or previous["max_patterns"] < 0)):
+                return "Save error: invalid max_patterns in authority metadata."
+        if not in_place and previous:
+            # A source policy changed after mount must not be copied using the
+            # session's stale authority. This is not a substitute for locking.
+            for key in fields:
+                if key in previous:
+                    value = previous[key]
+                    if state.get(key) != value:
+                        return "Save error: source authority changed since mount; remount before copying."
+        retained = ({key: previous[key] for key in fields if key in previous}
+                    if in_place and previous else
+                    {key: state[key] for key in fields if key in state and state[key] is not None})
+        # Reject invalid values before the cartridge write, not when
+        # save_manifest later constructs the sidecar.
+        if ("max_patterns" in retained and
+                (type(retained["max_patterns"]) is not int or retained["max_patterns"] < 0)):
+            return "Save error: invalid max_patterns in authority metadata."
+        if any(value is not None and not isinstance(value, str)
+               for key, value in retained.items() if key != "max_patterns"):
+            return "Save error: invalid authority metadata; cartridge was not changed."
         save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"))
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
 
         # Save integrity manifest
         manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]), **retained)
         state["modified"] = False
+        if source is None and save_name == state["cartridge_name"]:
+            state["cartridge_path"] = save_path
 
         # Also save brain weights if GPU is active
         brain_msg = ""
