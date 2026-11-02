@@ -310,6 +310,51 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertFalse(M.save_cartridge("copy", session_id=self.sid).startswith("Saved"))
             self.assertFalse(os.path.exists(os.path.join(temp, "cartridges", "copy.cart.npz")))
 
+    def test_builder_cart_save_preserves_hippocampus_and_pattern_zero(self):
+        from cartridge_builder import save_cartridge as build_cartridge
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            cart_dir = os.path.join(temp, "cartridges")
+            hippo, pattern0 = bytes(64), bytes(range(64))
+            path, _, _ = build_cartridge(cart_dir, "test", fake_embed("seed").reshape(1, -1),
+                                        ["seed"], metadata=[hippo], pattern0=pattern0)
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            self.assertIn("Stored memory #", M.memory_store("another", session_id=self.sid))
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(result.startswith("Saved"), result)
+            # The fixture is generated in this test, not external input.
+            with np.load(path, allow_pickle=True) as data:
+                self.assertIn("hippocampus", data.files)
+                self.assertIn("pattern0", data.files)
+                self.assertEqual(data["hippocampus"][0].tobytes(), hippo)
+                self.assertEqual(data["pattern0"].tobytes(), pattern0)
+            self.assertTrue(M.load_manifest(path)["has_hippocampus"])
+
+    def test_missing_manifest_flag_does_not_authorize_dropping_builder_payload(self):
+        from cartridge_builder import save_cartridge as build_cartridge
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            path, _, _ = build_cartridge(os.path.join(temp, "cartridges"), "test",
+                                        fake_embed("seed").reshape(1, -1), ["seed"],
+                                        metadata=[bytes(64)], pattern0=bytes(range(64)))
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            manifest = M.load_manifest(path)
+            del manifest["has_hippocampus"]  # legacy or incomplete sidecar, not evidence of absence
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream)
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            self.assertIn("Stored memory #", M.memory_store("another", session_id=self.sid))
+            result = M.save_cartridge(session_id=self.sid)
+            if result.startswith("Saved"):
+                with np.load(path, allow_pickle=True) as data:
+                    self.assertTrue({"hippocampus", "pattern0"} <= set(data.files), data.files)
+
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
