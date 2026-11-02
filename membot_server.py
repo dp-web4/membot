@@ -5850,12 +5850,10 @@ def _memory_store_locked(content: str, tags: str, session_id: str, state: dict) 
     if n_current >= MAX_ENTRIES:
         return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
-    pieces = _chunk_for_store(content)
+    # The legacy Mempack backend has no multipart transaction. Preserve its
+    # existing one-passage behavior instead of introducing partial groups.
+    pieces = [content] if is_mempack else _chunk_for_store(content)
     n_pieces = len(pieces)
-    # The existing Mempack writer commits a blob, rows and metadata separately;
-    # it cannot guarantee all-or-none for a multi-part logical memory.
-    if is_mempack and n_pieces > 1:
-        return "Chunked store unavailable for Mempacks until transactional persistence is supported."
     # ROOM FOR THE WHOLE ENTRY OR NONE OF IT. A chunked store that ran out of room
     # half-way would leave "(part 3/7)" as the end of a memory, and nothing would say so.
     if n_current + n_pieces > MAX_ENTRIES:
@@ -5927,7 +5925,7 @@ def _memory_store_locked(content: str, tags: str, session_id: str, state: dict) 
                     log.warning(f"Lattice imprint failed: {e}")
 
         # The pre-existing single-passage Mempack path is intentionally left
-        # unchanged; the multi-part path above is refused until it has a transaction.
+        # unchanged; it is not a transaction across the blob and row writes.
         if is_mempack and _supabase_available():
             try:
                 persist_msg = " + " + _mempack_persist_new_pattern(state, passages[0], embeddings[0])
@@ -8973,6 +8971,29 @@ async def rest_mempack_settings(request: Request) -> JSONResponse:
 # ENTRY POINT
 # ============================================================
 
+def _auto_mount(cart_name: str) -> str:
+    """Mount on startup through the same metadata and integrity path as MCP."""
+    try:
+        clean_name = sanitize_name(cart_name)
+    except ValueError as exc:
+        return str(exc)
+    carts = find_cartridges()
+    matching = [c for c in carts if clean_name.lower() in c["name"].lower()]
+    if not matching:
+        log.info(f"Cartridge '{clean_name}' not found — creating empty cartridge")
+        save_dir = os.path.join(BASE_DIR, "cartridges")
+        os.makedirs(save_dir, exist_ok=True)
+        empty_path = os.path.join(save_dir, f"{clean_name}.cart.npz")
+        empty_emb = np.zeros((0, 768), dtype=np.float32)
+        save_as_npz(empty_path, empty_emb, [])
+        save_manifest(empty_path, empty_emb, 0)
+        log.info(f"Created empty cartridge: {empty_path}")
+    session_id = _resolve_session_id("")
+    state = _get_session(session_id)
+    with state["store_lock"]:
+        return _mount_cartridge_locked(clean_name, session_id, "", state)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Membot — Brain Cartridge Server")
     parser.add_argument("--transport", default="stdio", choices=["stdio", "http", "sse"],
@@ -9009,41 +9030,8 @@ if __name__ == "__main__":
 
     # Auto-mount cartridge if requested
     if args.mount:
-        cart_name = args.mount
-        # Check if cartridge exists; if not, create empty one
-        matching = [c for c in carts if cart_name.lower() in c["name"].lower()]
-        if not matching:
-            log.info(f"Cartridge '{cart_name}' not found — creating empty cartridge")
-            save_dir = os.path.join(BASE_DIR, "cartridges")
-            os.makedirs(save_dir, exist_ok=True)
-            empty_path = os.path.join(save_dir, f"{cart_name}.cart.npz")
-            empty_emb = np.zeros((0, 768), dtype=np.float32)
-            save_as_npz(empty_path, empty_emb, [])
-            save_manifest(empty_path, empty_emb, 0)
-            log.info(f"Created empty cartridge: {empty_path}")
-
-        # Mount into default session (bypass @mcp.tool decorator)
-        sid = _resolve_session_id("")
-        state = _get_session(sid)
-        mount_carts = find_cartridges()
-        mount_match = [c for c in mount_carts if cart_name.lower() in c["name"].lower()]
-        if mount_match:
-            cart = mount_match[0]
-            data = load_cartridge_safe(cart["path"])
-            state["embeddings"] = data["embeddings"]
-            state["texts"] = data["texts"]
-            state["cartridge_name"] = cart["name"]
-            state["cartridge_path"] = cart["path"]
-            state["signatures"] = None
-            state["modified"] = False
-            if len(data["embeddings"]) > 0:
-                state["binary_corpus"] = (data["embeddings"] > 0).astype(np.uint8)
-            else:
-                state["binary_corpus"] = None
-            ok, verify_msg = verify_manifest(cart["path"], data["embeddings"], len(data["texts"]))
-            log.info(f"Auto-mounted '{cart['name']}': {len(data['texts'])} memories, integrity={verify_msg}")
-        else:
-            log.error(f"Auto-mount failed: '{cart_name}' still not found after creation")
+        result = _auto_mount(args.mount)
+        log.info(f"Auto-mount: {result}")
 
     # Setup HTTP middleware if not in stdio mode
     if args.transport != "stdio":

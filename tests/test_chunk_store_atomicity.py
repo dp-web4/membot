@@ -78,14 +78,15 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
         self.assertTrue(duplicate.startswith("Duplicate"), duplicate)
         self.assertEqual(len(self.state["texts"]), len(meta))
 
-    def test_remote_chunk_store_is_refused_without_any_side_effect(self):
+    def test_remote_long_store_uses_legacy_single_passage(self):
         self.state["mempack_id"] = "synthetic"
         with patch.object(M, "embed_text", wraps=fake_embed) as embed, \
+                patch.object(M, "_supabase_available", return_value=False), \
                 patch.object(M, "_mempack_persist_new_pattern") as persist:
             result = M.memory_store(LONG, session_id=self.sid)
-        self.assertIn("unavailable", result.lower())
-        self.assertEqual(self.state["texts"], [])
-        embed.assert_not_called()
+        self.assertIn("Stored memory #", result)
+        self.assertEqual(self.state["texts"], [LONG])
+        embed.assert_called_once()
         persist.assert_not_called()
 
     def test_remote_pattern_update_does_not_strip_existing_group_metadata(self):
@@ -132,6 +133,41 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.state["per_pattern_meta"][0] = {"source": "prior evidence"}
             M.memory_store(LONG, session_id=self.sid)
         self.assertEqual(self.state["per_pattern_meta"][0], {"source": "prior evidence"})
+
+    def test_startup_mount_preserves_groups_across_restart(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed), \
+                patch.object(M, "_resolve_session_id", side_effect=lambda sid: sid or self.sid):
+            first = M.memory_store(LONG, tags="test", session_id=self.sid)
+            group_id = self.state["per_pattern_meta"][0]["memory_group_id"]
+            self.assertIn(group_id, first)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+
+            # New state, same disk: call the very helper used by --mount.
+            M._sessions.pop(self.sid)
+            mounted = M._auto_mount("test")
+            self.assertIn("test", mounted)
+            restarted = M._get_session(self.sid)
+            self.assertEqual(restarted["per_pattern_meta"][0]["memory_group_id"], group_id)
+            M.memory_store("another note", session_id=self.sid)
+            duplicate = M.memory_store(LONG, tags="test", session_id=self.sid)
+            self.assertTrue(duplicate.startswith("Duplicate"), duplicate)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            reloaded = M.load_cartridge_safe(os.path.join(temp, "cartridges", "test.cart.npz"))
+            self.assertEqual(reloaded["per_pattern_meta"][0]["memory_group_id"], group_id)
+
+    def test_startup_mount_refuses_a_failed_integrity_check(self):
+        cart = {"name": "test", "path": "/synthetic/test.cart.npz"}
+        data = {"texts": [], "embeddings": np.array([]), "format": "npz"}
+        self.state["cartridge_name"] = None
+        with patch.object(M, "find_cartridges", return_value=[cart]), \
+                patch.object(M, "load_cartridge_safe", return_value=data), \
+                patch.object(M, "verify_manifest", return_value=(False, "injected mismatch")), \
+                patch.object(M, "_resolve_session_id", side_effect=lambda sid: sid or self.sid):
+            result = M._auto_mount("test")
+        self.assertIn("SECURITY", result)
+        self.assertIsNone(self.state["cartridge_name"])
 
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
