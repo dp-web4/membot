@@ -879,6 +879,48 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertIn("lock unavailable", result.lower())
             self.assertFalse(os.path.exists(os.path.join(temp, "cartridges", "test.cart.npz")))
 
+    @unittest.skipUnless(os.name == "posix" and "fork" in multiprocessing.get_all_start_methods(), "requires POSIX fork")
+    def test_contended_process_lock_returns_before_holder_releases(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed), \
+                patch.object(M, "_CARTRIDGE_LOCK_TIMEOUT_S", 0.1, create=True):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            before = M._cartridge_pair_revision(path)
+            M.memory_store("later", session_id=self.sid)
+            context = multiprocessing.get_context("fork")
+            ready, release = context.Event(), context.Event()
+            results = []
+
+            def hold():
+                with M._cooperating_cartridge_locks((path,)):
+                    ready.set()
+                    release.wait(5)
+
+            holder = context.Process(target=hold)
+            holder.start()
+            worker = None
+            try:
+                self.assertTrue(ready.wait(5), "synthetic holder did not acquire the lock")
+                worker = threading.Thread(target=lambda: results.append(M.save_cartridge(session_id=self.sid)))
+                worker.start()
+                worker.join(1.5)
+                completed_before_release = not worker.is_alive()
+            finally:
+                release.set()
+                if worker is not None:
+                    worker.join(5)
+                holder.join(5)
+                if holder.is_alive():
+                    holder.terminate()
+                    holder.join(5)
+            self.assertTrue(completed_before_release, "a contended save waited for the holder indefinitely")
+            self.assertEqual(holder.exitcode, 0)
+            self.assertEqual(len(results), 1)
+            self.assertIn("not started", results[0].lower())
+            self.assertEqual(M._cartridge_pair_revision(path), before)
+
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
