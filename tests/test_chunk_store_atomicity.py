@@ -803,11 +803,31 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                 child_results.close()
 
             self.assertTrue(first_result.startswith("Saved"), first_result)
+            self.assertNotEqual(second_result, "first save did not start")
             path = os.path.join(temp, "cartridges", "test.cart.npz")
             saved = M.load_cartridge_safe(path)
             contents = "\n".join(saved["texts"])
+            self.assertIn("[first]", contents, "the first successful save must survive")
             self.assertTrue(not second_result.startswith("Saved") or
                             ("[first]" in contents and "[second]" in contents), second_result)
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "requires POSIX no-follow")
+    def test_cartridge_save_refuses_symlinked_lock(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            cart_dir = os.path.join(temp, "cartridges")
+            os.makedirs(cart_dir)
+            sentinel = os.path.join(temp, "sentinel")
+            with open(sentinel, "w", encoding="utf-8") as stream:
+                stream.write("unchanged")
+            path = os.path.join(cart_dir, "test.cart.npz")
+            os.symlink(sentinel, path + ".membot.lock")
+            M.memory_store("synthetic", session_id=self.sid)
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertIn("lock unavailable", result)
+            self.assertFalse(os.path.exists(path))
+            with open(sentinel, encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "unchanged")
 
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
