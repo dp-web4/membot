@@ -829,6 +829,26 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             with open(sentinel, encoding="utf-8") as stream:
                 self.assertEqual(stream.read(), "unchanged")
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "requires POSIX locking")
+    def test_lock_release_failure_does_not_claim_nothing_was_saved(self):
+        import fcntl
+        real_flock = fcntl.flock
+
+        def fail_unlock(fd, operation):
+            if operation == fcntl.LOCK_UN:
+                raise OSError("synthetic unlock failure")
+            return real_flock(fd, operation)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("synthetic", session_id=self.sid)
+            with patch.object(fcntl, "flock", side_effect=fail_unlock):
+                result = M.save_cartridge(session_id=self.sid)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            self.assertTrue(os.path.exists(path), "the fixture commits before unlock fails")
+            self.assertIn("unknown", result.lower())
+            self.assertNotIn("nothing saved", result.lower())
+
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
