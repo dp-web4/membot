@@ -5,10 +5,12 @@ not connect to an embedder, an MCP server, or a remote persistence service.
 """
 import json
 import os
+import stat
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from unittest.mock import patch
 
 import numpy as np
@@ -317,7 +319,9 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                 patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
                 patch.object(M, "embed_text", fake_embed):
             cart_dir = os.path.join(temp, "cartridges")
-            hippo, pattern0 = bytes(64), bytes(range(64))
+            hippo_data = bytearray(64)
+            hippo_data[28] = 1  # tombstone: losing this byte would resurrect a passage
+            hippo, pattern0 = bytes(hippo_data), bytes(range(64))
             path, _, _ = build_cartridge(cart_dir, "test", fake_embed("seed").reshape(1, -1),
                                         ["seed"], metadata=[hippo], pattern0=pattern0)
             M._sessions.pop(self.sid)
@@ -331,6 +335,8 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                 self.assertIn("pattern0", data.files)
                 self.assertEqual(data["hippocampus"][0].tobytes(), hippo)
                 self.assertEqual(data["pattern0"].tobytes(), pattern0)
+                self.assertEqual(data["version"].item(), "mcp-v4")
+            self.assertEqual(M.load_cartridge_safe(path)["hippocampus"][0]["flags"] & 1, 1)
             self.assertTrue(M.load_manifest(path)["has_hippocampus"])
 
     def test_missing_manifest_flag_does_not_authorize_dropping_builder_payload(self):
@@ -351,9 +357,91 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
             self.assertIn("Stored memory #", M.memory_store("another", session_id=self.sid))
             result = M.save_cartridge(session_id=self.sid)
-            if result.startswith("Saved"):
-                with np.load(path, allow_pickle=True) as data:
-                    self.assertTrue({"hippocampus", "pattern0"} <= set(data.files), data.files)
+            self.assertTrue(result.startswith("Saved"), result)
+            with np.load(path, allow_pickle=True) as data:
+                self.assertTrue({"hippocampus", "pattern0"} <= set(data.files), data.files)
+
+    def test_builder_payload_refuses_changed_old_passages(self):
+        from cartridge_builder import save_cartridge as build_cartridge
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]):
+            path, _, _ = build_cartridge(os.path.join(temp, "cartridges"), "test",
+                                        fake_embed("seed").reshape(1, -1), ["seed"],
+                                        metadata=[bytes(64)], pattern0=bytes(64))
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            with open(path, "rb") as stream:
+                before = stream.read()
+            M._get_session(self.sid)["texts"][0] = "replaced"
+            self.assertFalse(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+
+    def test_builder_cart_copy_preserves_payload_and_authority(self):
+        from cartridge_builder import save_cartridge as build_cartridge
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]):
+            path, _, _ = build_cartridge(os.path.join(temp, "cartridges"), "test",
+                                        fake_embed("seed").reshape(1, -1), ["seed"],
+                                        metadata=[bytes(64)], pattern0=bytes(range(64)))
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            with open(path, "rb") as stream:
+                source = stream.read()
+            result = M.save_cartridge("copy", session_id=self.sid)
+            self.assertTrue(result.startswith("Saved"), result)
+            copied = os.path.join(temp, "cartridges", "copy.cart.npz")
+            with np.load(copied, allow_pickle=True) as data:
+                self.assertEqual(data["hippocampus"][0].tobytes(), bytes(64))
+                self.assertEqual(data["pattern0"].tobytes(), bytes(range(64)))
+            self.assertTrue(M.load_manifest(copied)["has_hippocampus"])
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), source)
+
+    def test_object_auxiliary_metadata_is_rejected_without_unpickling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = os.path.join(temp, "synthetic.npz")
+            np.savez_compressed(path, version="mcp-v4", hippocampus=np.array(["bad"], dtype=object))
+            with self.assertRaises(ValueError):
+                M._preserved_cart_members(path, 1)
+
+    def test_unknown_npz_member_cannot_be_silently_discarded(self):
+        from cartridge_builder import save_cartridge as build_cartridge
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]):
+            path, _, _ = build_cartridge(os.path.join(temp, "cartridges"), "test",
+                                        fake_embed("seed").reshape(1, -1), ["seed"])
+            with zipfile.ZipFile(path, "a") as cart:
+                cart.writestr("future_semantics.npy", b"synthetic unknown field")
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            with open(path, "rb") as stream:
+                before = stream.read()
+            self.assertFalse(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+
+    def test_save_preserves_mode_and_refuses_a_hardlinked_destination(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            self.assertIn("Stored memory #", M.memory_store("seed", session_id=self.sid))
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            os.chmod(path, 0o640)
+            self.assertIn("Stored memory #", M.memory_store("second", session_id=self.sid))
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+            link = os.path.join(temp, "cartridges", "alias.cart.npz")
+            os.link(path, link)
+            with open(path, "rb") as stream:
+                before = stream.read()
+            self.assertIn("Stored memory #", M.memory_store("third", session_id=self.sid))
+            self.assertFalse(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            with open(link, "rb") as stream:
+                self.assertEqual(stream.read(), before)
 
     def test_manifest_detects_group_identity_tampering(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \

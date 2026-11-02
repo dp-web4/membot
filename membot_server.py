@@ -50,6 +50,7 @@ import struct
 import hashlib
 import pickle
 import sqlite3
+import stat
 import zlib
 import time
 import base64
@@ -59,7 +60,10 @@ import uuid
 import logging
 import argparse
 import collections
+import io
 import math
+import tempfile
+import zipfile
 import numpy as np
 
 # --- Logging (stderr only — stdout is reserved for MCP JSON-RPC) ---
@@ -195,7 +199,9 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
                   world_perms: str | None = None,
                   group_id: str | None = None,
                   max_patterns: int | None = None,
-                  cart_type: str | None = None):
+                  cart_type: str | None = None,
+                  *, version: str = "mcp-v3", has_hippocampus: bool | None = None,
+                  rebuilt_by: str | None = None):
     """Save integrity manifest alongside cartridge.
 
     Pattern 0 v2 fields:
@@ -213,7 +219,7 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
     """
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     manifest = {
-        "version": "mcp-v3",
+        "version": version,
         "count": n_texts,
         "fingerprint": compute_fingerprint(embeddings, n_texts),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -236,6 +242,10 @@ def save_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int,
         manifest["max_patterns"] = int(max_patterns)
     if cart_type is not None:
         manifest["cart_type"] = cart_type
+    if has_hippocampus is not None:
+        manifest["has_hippocampus"] = has_hippocampus
+    if rebuilt_by is not None:
+        manifest["rebuilt_by"] = rebuilt_by
 
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
@@ -315,6 +325,7 @@ def _new_session() -> dict:
         "cartridge_name": None,
         "store_lock": threading.RLock(),  # serialize store calls within a session
         "cartridge_path": None,
+        "mounted_texts": None,    # snapshot used to protect append-only auxiliary metadata
         "briefing": None,         # Pattern 0 v2 Phase 1 — cart's agent-facing introduction
         # Pattern 0 v2 Phase 2 — ownership/access control. Defaults preserve
         # legacy behavior: no owner, world readable, no caps.
@@ -1517,7 +1528,8 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
     return result
 
 
-def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern_meta=None):
+def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern_meta=None,
+                *, version="mcp-v3", extra_members=None):
     """Save cartridge in safe NPZ format (no pickle, no code execution)."""
     if embeddings is None:
         if texts:
@@ -1528,12 +1540,40 @@ def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
 
     fields = dict(embeddings=embeddings, passages=np.array(texts, dtype=object),
-                  compressed_texts=np.array(compressed_texts, dtype=object), version="mcp-v3")
+                  compressed_texts=np.array(compressed_texts, dtype=object), version=version)
     if per_pattern_meta is not None:
         if len(per_pattern_meta) != len(texts):
             raise ValueError("per-pattern metadata does not match passage count")
         fields["per_pattern_meta"] = np.array(json.dumps(per_pattern_meta), dtype=object)
-    np.savez_compressed(path, **fields)
+    # Write to an owned same-directory temp, preserving validated raw auxiliary
+    # NPY members without unpickling them. This only publishes the NPZ; its
+    # sidecar still needs a recoverable cross-file transaction.
+    prior_mode = None
+    if os.path.lexists(path):
+        existing = os.lstat(path)
+        if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+            raise ValueError("refusing to replace a non-regular or multiply linked cartridge")
+        if hasattr(os, "geteuid") and existing.st_uid != os.geteuid():
+            raise ValueError("refusing to replace a cartridge owned by another user")
+        if hasattr(os, "listxattr") and os.listxattr(path, follow_symlinks=False):
+            raise ValueError("refusing to discard cartridge extended attributes")
+        prior_mode = stat.S_IMODE(existing.st_mode)
+    fd, tmp = tempfile.mkstemp(prefix=".membot-save-", suffix=".npz", dir=os.path.dirname(path) or ".")
+    try:
+        try:
+            if prior_mode is not None:
+                os.fchmod(fd, prior_mode)
+        finally:
+            os.close(fd)
+        np.savez_compressed(tmp, **fields)
+        if extra_members:
+            with zipfile.ZipFile(tmp, "a", compression=zipfile.ZIP_DEFLATED) as cart:
+                for name, payload in extra_members.items():
+                    cart.writestr(name, payload)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 # ============================================================
@@ -4889,6 +4929,7 @@ def _mount_cartridge_locked(name: str, session_id: str, owner_id: str, state: di
 
         state["embeddings"] = embeddings
         state["texts"] = texts
+        state["mounted_texts"] = tuple(texts)
         state["cartridge_name"] = cart["name"]
         state["cartridge_path"] = cart["path"]
         state["signatures"] = None
@@ -6000,6 +6041,41 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
         return _save_cartridge_locked(name, session_id, state)
 
 
+def _preserved_cart_members(source: str, n_texts: int):
+    """Read only known non-object auxiliary NPY members, without unpickling.
+
+    An unfamiliar member is refused: its semantics might depend on content we
+    are changing. This helper does not make the ordinary NPZ loader safe.
+    """
+    known = {"embeddings.npy", "passages.npy", "compressed_texts.npy", "version.npy",
+             "per_pattern_meta.npy", "hippocampus.npy", "pattern0.npy"}
+    extras = {}
+    version = "mcp-v3"
+    with zipfile.ZipFile(source) as cart:
+        members = cart.namelist()
+        if len(members) != len(set(members)) or set(members) - known:
+            raise ValueError("unsupported cartridge members; refusing to discard data")
+        for name in ("version.npy", "hippocampus.npy", "pattern0.npy"):
+            if name not in members:
+                continue
+            limit = 4096 if name == "version.npy" else min(MAX_ENTRIES * 64 + 65536, 64 * 1024 * 1024)
+            if cart.getinfo(name).file_size > limit:
+                raise ValueError("auxiliary cartridge member exceeds safe size")
+            payload = cart.read(name)
+            arr = np.load(io.BytesIO(payload), allow_pickle=False)
+            if name == "version.npy":
+                if arr.ndim != 0 or arr.dtype.kind != "U" or arr.item() not in ("mcp-v3", "mcp-v4"):
+                    raise ValueError("unsupported cartridge version")
+                version = arr.item()
+            else:
+                valid_shape = (arr.ndim == 2 and arr.shape[1] == 64 and arr.shape[0] <= n_texts
+                               if name == "hippocampus.npy" else arr.shape == (64,))
+                if arr.dtype != np.uint8 or not valid_shape:
+                    raise ValueError("unsupported auxiliary cartridge metadata")
+                extras[name] = payload
+    return version, extras
+
+
 def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
     log.info(f"save_cartridge('{name}', session={session_id})")
 
@@ -6038,9 +6114,14 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         fields = ("briefing", "owner_id", "owner_perms", "group_perms", "world_perms",
                   "group_id", "max_patterns", "cart_type")
         if previous:
-            unknown = set(previous) - set(fields) - {"version", "count", "fingerprint", "timestamp"}
+            unknown = set(previous) - set(fields) - {
+                "version", "count", "fingerprint", "timestamp", "has_hippocampus", "rebuilt_by"}
             if unknown:
                 return "Save error: unsupported manifest fields; refusing to discard their meaning."
+            if "has_hippocampus" in previous and type(previous["has_hippocampus"]) is not bool:
+                return "Save error: invalid hippocampus metadata."
+            if "rebuilt_by" in previous and not isinstance(previous["rebuilt_by"], str):
+                return "Save error: invalid builder metadata."
             if ("max_patterns" in previous and
                     (type(previous["max_patterns"]) is not int or previous["max_patterns"] < 0)):
                 return "Save error: invalid max_patterns in authority metadata."
@@ -6063,14 +6144,29 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         if any(value is not None and not isinstance(value, str)
                for key, value in retained.items() if key != "max_patterns"):
             return "Save error: invalid authority metadata; cartridge was not changed."
-        save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"))
+        original = state.get("mounted_texts")
+        source_count = len(original) if original is not None else len(state["texts"])
+        version, extras = _preserved_cart_members(source, source_count) if source else ("mcp-v3", {})
+        if extras:
+            if original is None or state["texts"][:len(original)] != list(original):
+                return "Save error: original passages changed; auxiliary metadata cannot be retained safely."
+        has_hippo = "hippocampus.npy" in extras
+        if previous and "has_hippocampus" in previous and previous["has_hippocampus"] != has_hippo:
+            return "Save error: manifest and cartridge disagree about hippocampus metadata."
+        save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"),
+                    version=version, extra_members=extras)
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
 
         # Save integrity manifest
-        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]), **retained)
+        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]), version=version,
+                                 has_hippocampus=has_hippo if has_hippo or (previous and "has_hippocampus" in previous) else None,
+                                 rebuilt_by="membot.save_cartridge" if previous and "rebuilt_by" in previous else None,
+                                 **retained)
         state["modified"] = False
         if source is None and save_name == state["cartridge_name"]:
             state["cartridge_path"] = save_path
+        if in_place or source is None:
+            state["mounted_texts"] = tuple(state["texts"])
 
         # Also save brain weights if GPU is active
         brain_msg = ""
@@ -6124,6 +6220,7 @@ def _unmount_locked(session_id: str, state: dict) -> str:
     # Reset session state but keep it alive
     state["cartridge_name"] = None
     state["cartridge_path"] = None
+    state["mounted_texts"] = None
     state["mempack_id"] = None
     state["embeddings"] = None
     state["texts"] = []
