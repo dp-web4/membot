@@ -849,6 +849,36 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertIn("unknown", result.lower())
             self.assertNotIn("nothing saved", result.lower())
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "O_NOFOLLOW"), "requires POSIX locking")
+    def test_lock_release_attempts_every_descriptor_after_an_error(self):
+        import fcntl
+        real_flock = fcntl.flock
+        released = []
+
+        def fail_first_unlock(fd, operation):
+            if operation == fcntl.LOCK_UN:
+                released.append(fd)
+                if len(released) == 1:
+                    raise OSError("synthetic unlock failure")
+            return real_flock(fd, operation)
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(fcntl, "flock", side_effect=fail_first_unlock):
+            with self.assertRaisesRegex(OSError, "release failed"):
+                with M._cooperating_cartridge_locks((os.path.join(temp, "a"), os.path.join(temp, "b"))):
+                    pass
+            self.assertEqual(len(released), 2)
+            for fd in released:
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+
+    def test_save_fails_closed_when_process_locking_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed), patch.dict(sys.modules, {"fcntl": None}):
+            M.memory_store("synthetic", session_id=self.sid)
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertIn("lock unavailable", result.lower())
+            self.assertFalse(os.path.exists(os.path.join(temp, "cartridges", "test.cart.npz")))
+
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
