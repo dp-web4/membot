@@ -720,6 +720,54 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             successes = sum(result.startswith("Saved") for result in results.values())
             self.assertTrue(successes < 2 or ("[first]" in contents and "[second]" in contents), results)
 
+    def test_direct_writer_after_preflight_cannot_be_silently_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            M.memory_store("session edit", session_id=self.sid)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            old = M.load_cartridge_safe(path)
+            external_texts = list(old["texts"]) + ["external writer"]
+            external_embeddings = np.vstack([old["embeddings"], fake_embed("external writer")])
+            original_save = M.save_as_npz
+
+            def interleaved(*args, **kwargs):
+                # Model another writer which does not enter save_cartridge's process lock.
+                original_save(path, external_embeddings, external_texts)
+                M.save_manifest(path, external_embeddings, len(external_texts))
+                return original_save(*args, **kwargs)
+
+            with patch.object(M, "save_as_npz", side_effect=interleaved):
+                outcome = M.save_cartridge(session_id=self.sid)
+            saved = M.load_cartridge_safe(path)
+            self.assertTrue(not outcome.startswith("Saved") or "external writer" in saved["texts"], outcome)
+
+    def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            with open(path, "rb") as stream:
+                original_cart = stream.read()
+            with open(manifest_path, "rb") as stream:
+                original_manifest = stream.read()
+            M.memory_store("new memory", session_id=self.sid)
+            with patch.object(M, "save_manifest", side_effect=OSError("synthetic manifest failure")):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertFalse(outcome.startswith("Saved"), outcome)
+            with open(path, "rb") as stream:
+                current_cart = stream.read()
+            with open(manifest_path, "rb") as stream:
+                current_manifest = stream.read()
+            self.assertEqual((current_cart, current_manifest), (original_cart, original_manifest),
+                             "a failed pair publication left the two files split")
+
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
         release = threading.Event()
