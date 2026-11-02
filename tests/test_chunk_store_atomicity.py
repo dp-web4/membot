@@ -548,6 +548,28 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             ok, detail = M.verify_manifest(path, tampered["embeddings"], len(tampered["texts"]))
             self.assertFalse(ok, detail)
 
+    def test_save_does_not_launder_a_changed_mounted_cartridge(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store(LONG, session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            changed = M.load_cartridge_safe(path)
+            changed["per_pattern_meta"][0]["memory_group_id"] = "changed-after-mount"
+            M.save_as_npz(path, changed["embeddings"], changed["texts"], changed["per_pattern_meta"])
+            with open(path, "rb") as stream:
+                changed_bytes = stream.read()
+            M.memory_store("another note", session_id=self.sid)
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertIn("changed", result.lower(), result)
+            self.assertFalse(result.startswith("Saved"), result)
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), changed_bytes)
+            self.assertFalse(M.verify_manifest(path, changed["embeddings"], len(changed["texts"]))[0])
+
     def test_manifest_covers_text_and_middle_embedding_not_just_group_metadata(self):
         for mutation in ("text", "middle_embedding"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp, \

@@ -6168,6 +6168,12 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         previous = load_manifest(metadata_path) if metadata_path else None
         if manifest_path and os.path.exists(manifest_path) and not isinstance(previous, dict):
             return "Save error: existing manifest is unreadable; authority metadata was not changed."
+        if previous and "content_sha256" in previous:
+            expected_content = previous["content_sha256"]
+            if (not isinstance(expected_content, str) or
+                    not re.fullmatch(r"[0-9a-f]{64}", expected_content) or
+                    _cartridge_sha256(metadata_path) != expected_content):
+                return "Save error: source cartridge changed or checksum is invalid; remount after investigation."
         fields = ("briefing", "owner_id", "owner_perms", "group_perms", "world_perms",
                   "group_id", "max_patterns", "cart_type")
         if previous:
