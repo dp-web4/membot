@@ -640,6 +640,62 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertTrue(not second_save.startswith("Saved") or
                             ("[first]" in all_text and "[second]" in all_text), second_save)
 
+    def test_two_concurrent_saves_cannot_both_succeed_after_stale_preflight(self):
+        other_sid = "chunk-atomicity-race"
+        self.addCleanup(M._sessions.pop, other_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M._sessions.pop(self.sid)
+            for sid in (self.sid, other_sid):
+                self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=sid))
+            M.memory_store(LONG, tags="first", session_id=self.sid)
+            M.memory_store(LONG, tags="second", session_id=other_sid)
+            second_at_save = threading.Event()
+            first_at_save = threading.Event()
+            first_finished = threading.Event()
+            original_save = M.save_as_npz
+            results = {}
+
+            def gated_save(*args, **kwargs):
+                # On an unlocked implementation, let the second caller pass
+                # preflight before the first publishes, then delay its write
+                # until the first whole save finishes. A correct serialization
+                # may keep the second out of this function; do not deadlock it.
+                if threading.current_thread().name == "second-save":
+                    second_at_save.set()
+                    if not first_finished.wait(5):
+                        raise RuntimeError("first save did not finish")
+                else:
+                    first_at_save.set()
+                    second_at_save.wait(0.5)
+                return original_save(*args, **kwargs)
+
+            def save(sid, first=False):
+                try:
+                    results[sid] = M.save_cartridge(session_id=sid)
+                finally:
+                    if first:
+                        first_finished.set()
+
+            with patch.object(M, "save_as_npz", side_effect=gated_save):
+                first = threading.Thread(target=save, args=(self.sid, True), name="first-save")
+                second = threading.Thread(target=save, args=(other_sid,), name="second-save")
+                first.start()
+                self.assertTrue(first_at_save.wait(5), "first did not reach the write")
+                second.start()
+                first.join(timeout=8)
+                second.join(timeout=8)
+            self.assertFalse(first.is_alive() or second.is_alive(), "synthetic save timed out")
+            self.assertEqual(set(results), {self.sid, other_sid})
+            self.assertTrue(results[self.sid].startswith("Saved"), results)
+            loaded = M.load_cartridge_safe(os.path.join(temp, "cartridges", "test.cart.npz"))
+            contents = "\n".join(loaded["texts"])
+            successes = sum(result.startswith("Saved") for result in results.values())
+            self.assertTrue(successes < 2 or ("[first]" in contents and "[second]" in contents), results)
+
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
         release = threading.Event()
