@@ -116,19 +116,43 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
 
     def test_switching_to_local_cart_clears_old_remote_identity(self):
         self.state["mempack_id"] = "old-remote"
-        fake_cart = {"name": "local", "path": "/synthetic/local.cart.npz"}
         loaded = {"texts": [], "embeddings": np.array([]), "format": "npz"}
-        with patch.object(M, "find_cartridges", return_value=[fake_cart]), \
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(M, "find_cartridges", return_value=[{"name": "local", "path": os.path.join(temp, "local.cart.npz")}]), \
                 patch.object(M, "load_cartridge_safe", return_value=loaded), \
                 patch.object(M, "verify_manifest", return_value=(True, "test")), \
                 patch.object(M, "load_manifest", return_value=None), \
                 patch.object(M.os.path, "exists", return_value=False):
+            with open(os.path.join(temp, "local.cart.npz"), "wb") as stream:
+                stream.write(b"synthetic source")
             result = M.mount_cartridge("local", session_id=self.sid)
         self.assertIn("local", result)
+        self.assertNotIn("Mount failed", result)
         self.assertIsNone(self.state["mempack_id"])
         self.state["mempack_id"] = "synthetic"
         M.unmount(session_id=self.sid)
         self.assertIsNone(self.state["mempack_id"])
+
+    def test_missing_source_cannot_mount_a_fabricated_revision(self):
+        self.state["mempack_id"] = "old-remote"
+        fake = {"name": "local", "path": "/synthetic/missing.cart.npz"}
+        loaded = {"texts": [], "embeddings": np.array([]), "format": "npz"}
+        with patch.object(M, "find_cartridges", return_value=[fake]), \
+                patch.object(M, "load_cartridge_safe", return_value=loaded), \
+                patch.object(M, "verify_manifest", return_value=(True, "test")):
+            result = M.mount_cartridge("local", session_id=self.sid)
+        self.assertIn("failed", result.lower())
+        self.assertEqual(self.state["mempack_id"], "old-remote")
+
+    def test_a_session_can_save_its_own_next_revision(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("first", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M.memory_store("second", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            loaded = M.load_cartridge_safe(os.path.join(temp, "cartridges", "test.cart.npz"))
+            self.assertEqual(len(loaded["texts"]), 2)
 
     def test_existing_metadata_is_preserved_when_storing(self):
         with patch.object(M, "embed_text", fake_embed):

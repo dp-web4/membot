@@ -166,6 +166,17 @@ def _cartridge_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _cartridge_pair_revision(path: str) -> tuple[str, str | None]:
+    """Content observation for cooperative in-process stale-save detection, not authentication."""
+    cart_hash = _cartridge_sha256(path)
+    manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+    try:
+        manifest_hash = _cartridge_sha256(manifest_path)
+    except FileNotFoundError:
+        manifest_hash = None
+    return cart_hash, manifest_hash
+
+
 # Pattern 0 v2 permission helpers.
 # Permission semantics from spec docs/RFC/pattern-0-v2-spec.md:
 #   r = read (search the cart)        bit 0 = 1
@@ -340,12 +351,17 @@ def is_trusted_directory(path: str) -> bool:
 SESSION_TIMEOUT_SEC = 1800   # 30 minutes idle → session expires
 MAX_SESSIONS = 50            # Max concurrent sessions
 
+# A preliminary in-process boundary only. Other processes and writer entrypoints do not
+# participate; this does not make the NPZ/manifest pair crash-atomic.
+_cartridge_revision_lock = threading.RLock()
+
 def _new_session() -> dict:
     """Create a fresh session state dict."""
     return {
         "cartridge_name": None,
         "store_lock": threading.RLock(),  # serialize store calls within a session
         "cartridge_path": None,
+        "cartridge_revision": None,
         "mounted_texts": None,    # snapshot used to protect append-only auxiliary metadata
         "briefing": None,         # Pattern 0 v2 Phase 1 — cart's agent-facing introduction
         # Pattern 0 v2 Phase 2 — ownership/access control. Defaults preserve
@@ -4910,7 +4926,8 @@ def mount_cartridge(name: str, session_id: str = "", owner_id: str = "") -> str:
     session_id = _resolve_session_id(session_id)
     state = _get_session(session_id)
     with state["store_lock"]:
-        return _mount_cartridge_locked(name, session_id, owner_id, state)
+        with _cartridge_revision_lock:
+            return _mount_cartridge_locked(name, session_id, owner_id, state)
 
 
 def _mount_cartridge_locked(name: str, session_id: str, owner_id: str, state: dict) -> str:
@@ -4984,11 +5001,13 @@ def _mount_cartridge_locked(name: str, session_id: str, owner_id: str, state: di
                 log.error(f"INTEGRITY CHECK FAILED for {cart['name']}: {verify_msg}")
                 return f"SECURITY: Cartridge '{cart['name']}' failed integrity check: {verify_msg}. Refusing to mount."
 
+        mounted_revision = _cartridge_pair_revision(cart["path"])
         state["embeddings"] = embeddings
         state["texts"] = texts
         state["mounted_texts"] = tuple(texts)
         state["cartridge_name"] = cart["name"]
         state["cartridge_path"] = cart["path"]
+        state["cartridge_revision"] = mounted_revision
         state["signatures"] = None
         state["hippocampus"] = data.get("hippocampus")
         state["per_pattern_meta"] = data.get("per_pattern_meta")
@@ -6095,7 +6114,8 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
     session_id = _resolve_session_id(session_id)
     state = _get_session(session_id)
     with state["store_lock"]:
-        return _save_cartridge_locked(name, session_id, state)
+        with _cartridge_revision_lock:
+            return _save_cartridge_locked(name, session_id, state)
 
 
 def _preserved_cart_members(source: str, n_texts: int):
@@ -6168,6 +6188,10 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         previous = load_manifest(metadata_path) if metadata_path else None
         if manifest_path and os.path.exists(manifest_path) and not isinstance(previous, dict):
             return "Save error: existing manifest is unreadable; authority metadata was not changed."
+        if source:
+            mounted_revision = state.get("cartridge_revision")
+            if mounted_revision is None or _cartridge_pair_revision(source) != mounted_revision:
+                return "Save error: mounted source changed or has no revision; remount before saving."
         if previous and "content_sha256" in previous:
             expected_content = previous["content_sha256"]
             if (not isinstance(expected_content, str) or
@@ -6230,6 +6254,8 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
             state["cartridge_path"] = save_path
         if in_place or source is None:
             state["mounted_texts"] = tuple(state["texts"])
+            if state.get("cartridge_path"):
+                state["cartridge_revision"] = _cartridge_pair_revision(state["cartridge_path"])
 
         # Also save brain weights if GPU is active
         brain_msg = ""
@@ -6283,6 +6309,7 @@ def _unmount_locked(session_id: str, state: dict) -> str:
     # Reset session state but keep it alive
     state["cartridge_name"] = None
     state["cartridge_path"] = None
+    state["cartridge_revision"] = None
     state["mounted_texts"] = None
     state["mempack_id"] = None
     state["embeddings"] = None
