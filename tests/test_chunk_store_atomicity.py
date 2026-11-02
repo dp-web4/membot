@@ -4,6 +4,7 @@ These tests use only synthetic session state and temporary cartridges. They do
 not connect to an embedder, an MCP server, or a remote persistence service.
 """
 import json
+import multiprocessing
 import os
 import stat
 import sys
@@ -745,6 +746,68 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                 outcome = M.save_cartridge(session_id=self.sid)
             saved = M.load_cartridge_safe(path)
             self.assertTrue(not outcome.startswith("Saved") or "external writer" in saved["texts"], outcome)
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
+    def test_cross_process_saves_cannot_both_succeed_after_stale_preflight(self):
+        other_sid = "chunk-atomicity-process"
+        self.addCleanup(M._sessions.pop, other_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M._sessions.pop(self.sid)
+            for sid in (self.sid, other_sid):
+                self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=sid))
+            M.memory_store(LONG, tags="first", session_id=self.sid)
+            M.memory_store(LONG, tags="second", session_id=other_sid)
+            context = multiprocessing.get_context("fork")
+            first_at_save = context.Event()
+            second_at_save = context.Event()
+            first_finished = context.Event()
+            child_results = context.Queue()
+            original_save = M.save_as_npz
+
+            def child():
+                def delayed(*args, **kwargs):
+                    second_at_save.set()
+                    if not first_finished.wait(5):
+                        raise RuntimeError("first save did not finish")
+                    return original_save(*args, **kwargs)
+                if not first_at_save.wait(5):
+                    child_results.put("first save did not start")
+                    return
+                with patch.object(M, "save_as_npz", side_effect=delayed):
+                    child_results.put(M.save_cartridge(session_id=other_sid))
+
+            def first_save(*args, **kwargs):
+                first_at_save.set()
+                second_at_save.wait(0.5)  # a correct process lock keeps the child out
+                return original_save(*args, **kwargs)
+
+            child_process = context.Process(target=child)
+            child_process.start()
+            try:
+                with patch.object(M, "save_as_npz", side_effect=first_save):
+                    first_result = M.save_cartridge(session_id=self.sid)
+                first_finished.set()
+                child_process.join(8)
+                self.assertFalse(child_process.is_alive(), "synthetic child timed out")
+                self.assertEqual(child_process.exitcode, 0)
+                second_result = child_results.get(timeout=2)
+            finally:
+                first_finished.set()
+                if child_process.is_alive():
+                    child_process.terminate()
+                    child_process.join(5)
+                child_results.close()
+
+            self.assertTrue(first_result.startswith("Saved"), first_result)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            saved = M.load_cartridge_safe(path)
+            contents = "\n".join(saved["texts"])
+            self.assertTrue(not second_result.startswith("Saved") or
+                            ("[first]" in contents and "[second]" in contents), second_result)
 
     def test_failed_manifest_publish_must_not_silently_split_the_pair(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
