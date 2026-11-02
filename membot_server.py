@@ -387,11 +387,19 @@ def _cooperating_cartridge_locks(paths):
                 raise OSError("cartridge lock file changed during acquisition")
         yield
     finally:
+        release_error = None
         for fd in reversed(locks):
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError as exc:
+                release_error = release_error or exc
             finally:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    release_error = release_error or exc
+        if release_error is not None:
+            raise OSError("cartridge lock release failed") from release_error
 
 
 def _new_session() -> dict:
@@ -6168,7 +6176,8 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
                 with _cooperating_cartridge_locks((state.get("cartridge_path"), destination)):
                     return _save_cartridge_locked(name, session_id, state)
             except OSError as exc:
-                return f"Save error: cartridge lock unavailable; nothing saved ({exc})."
+                return (f"Save outcome unknown: cartridge lock unavailable or release failed ({exc}); "
+                        "inspect the destination before retrying.")
 
 
 def _preserved_cart_members(source: str, n_texts: int):
