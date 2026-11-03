@@ -1355,6 +1355,8 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                     self.fail("synthetic writer did not exit")
                 self.assertEqual(process.exitcode, 73)
                 self.assertTrue(os.path.exists(cart + ".pending"))
+                observed = M._inspect_pending_pair(cart)
+                self.assertEqual(observed.get("classification"), "mixed" if existing else "unknown", observed)
                 reader_sid = "process-exit-reader"
                 M._sessions.pop(reader_sid, None)
                 self.addCleanup(M._sessions.pop, reader_sid, None)
@@ -1420,7 +1422,8 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             cart = os.path.join(temp, "synthetic.cart.npz")
             self.assertEqual(M._inspect_pending_pair(cart).get("classification"), "no_marker")
             marker = cart + ".pending"
-            for payload in (b"truncated", b'{"schema":"a","schema":"b"}', b"x" * 8193):
+            for payload in (b"truncated", b"membot-pair-publication-pending-v1\n",
+                            b'{"schema":"a","schema":"b"}', b"x" * 8193):
                 with open(marker, "wb") as stream:
                     stream.write(payload)
                 os.chmod(marker, 0o600)
@@ -1428,6 +1431,58 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                     result = M._inspect_pending_pair(cart)
                 self.assertEqual(result.get("classification"), "unknown", result)
                 self.assertTrue(os.path.exists(marker))
+
+    def test_pending_inspection_rejects_oversized_artifacts_and_changed_marker(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M.memory_store("new", session_id=self.sid)
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            with patch.object(M, "_sync_pair_directory", side_effect=OSError("synthetic")):
+                self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Save outcome unknown"))
+            self.assertEqual(M._inspect_pending_pair(cart, max_artifact_bytes=1)["classification"], "unknown")
+            marker = cart + ".pending"
+            inode = os.stat(marker).st_ino
+            real_read = os.read
+            changed = False
+
+            def change_marker_after_read(fd, size):
+                nonlocal changed
+                block = real_read(fd, size)
+                if block and not changed and os.fstat(fd).st_ino == inode:
+                    changed = True
+                    with open(marker, "ab") as stream:
+                        stream.write(b"tampered")
+                return block
+
+            with patch.object(M.os, "read", side_effect=change_marker_after_read):
+                result = M._inspect_pending_pair(cart)
+            self.assertTrue(changed)
+            self.assertEqual(result["classification"], "unknown")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_pending_inspection_rejects_marker_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cart = os.path.join(temp, "synthetic.cart.npz")
+            os.symlink("nonexistent", cart + ".pending")
+            self.assertEqual(M._inspect_pending_pair(cart)["classification"], "unknown")
+
+    def test_pending_inspection_does_not_choose_between_identical_before_and_intended(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cart = os.path.join(temp, "synthetic.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            with open(cart, "wb") as stream:
+                stream.write(b"cart")
+            with open(manifest, "wb") as stream:
+                stream.write(b"manifest")
+            pair = {"cartridge": M._cartridge_sha256(cart), "manifest": M._cartridge_sha256(manifest)}
+            marker = {"schema": "membot-pair-pending-v2", "target": os.path.basename(cart),
+                      "before": pair, "intended": pair}
+            with open(cart + ".pending", "w") as stream:
+                json.dump(marker, stream)
+            os.chmod(cart + ".pending", 0o600)
+            self.assertEqual(M._inspect_pending_pair(cart)["classification"], "matches_both")
 
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \

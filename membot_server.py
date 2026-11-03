@@ -311,6 +311,97 @@ def _pair_publication_pending(cart_path: str) -> bool:
     return True
 
 
+def _observe_pair_file(path: str, limit: int, *, content=False, private=False):
+    """Bounded no-follow observation, not an atomic or authenticated snapshot."""
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("safe observation unavailable")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > limit:
+            raise ValueError("unsafe or oversized observed file")
+        if private and (not hasattr(os, "geteuid") or before.st_uid != os.geteuid() or before.st_mode & 0o077):
+            raise ValueError("unsafe marker permissions")
+        digest = hashlib.sha256()
+        chunks = []
+        count = 0
+        while True:
+            block = os.read(fd, min(1024 * 1024, limit + 1 - count))
+            if not block:
+                break
+            count += len(block)
+            if count > limit:
+                raise ValueError("observed file grew beyond limit")
+            digest.update(block)
+            if content:
+                chunks.append(block)
+        after, named = os.fstat(fd), os.lstat(path)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_nlink)
+        if identity(before) != identity(after) or identity(after) != identity(named):
+            raise ValueError("observed file changed")
+        return (b"".join(chunks) if content else digest.hexdigest()), identity(after)
+    finally:
+        os.close(fd)
+
+
+def _inspect_pending_pair(cart_path: str, max_artifact_bytes: int = 64 * 1024 * 1024) -> dict:
+    """Compare bytes to an untrusted marker; never deserialize, mutate, or authorize recovery.
+
+    Each file is observed separately. Even matching hashes do not prove an
+    atomic snapshot, durable commit, actor identity or marker authenticity.
+    """
+    if type(max_artifact_bytes) is not int or max_artifact_bytes <= 0:
+        return {"classification": "unknown"}
+    marker = cart_path + ".pending"
+    try:
+        raw, marker_identity = _observe_pair_file(marker, 8192, content=True, private=True)
+    except FileNotFoundError:
+        return {"classification": "no_marker"}
+    except (OSError, ValueError):
+        return {"classification": "unknown"}
+    try:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate marker field")
+                result[key] = value
+            return result
+
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+        if (not isinstance(payload, dict) or set(payload) != {"schema", "target", "before", "intended"}
+                or payload["schema"] != "membot-pair-pending-v2"
+                or payload["target"] != os.path.basename(cart_path)):
+            raise ValueError("unsupported marker")
+        for field in ("before", "intended"):
+            value = payload[field]
+            if not isinstance(value, dict) or set(value) != {"cartridge", "manifest"}:
+                raise ValueError("invalid pair marker")
+            for digest in value.values():
+                if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+                    raise ValueError("invalid pair digest")
+        if any(value is None for value in payload["intended"].values()):
+            raise ValueError("missing intended digest")
+
+        observed = {}
+        for key, path in (("cartridge", cart_path),
+                          ("manifest", cart_path.rsplit(".", 1)[0] + "_manifest.json")):
+            try:
+                observed[key], _ = _observe_pair_file(path, max_artifact_bytes)
+            except FileNotFoundError:
+                observed[key] = None
+        raw_again, identity_again = _observe_pair_file(marker, 8192, content=True, private=True)
+        if raw_again != raw or identity_again != marker_identity:
+            raise ValueError("marker changed during observation")
+        before = observed == payload["before"]
+        intended = observed == payload["intended"]
+        classification = ("matches_both" if before and intended else "matches_before" if before
+                          else "matches_intended" if intended else "mixed")
+        return {"classification": classification}
+    except (OSError, ValueError, UnicodeError, TypeError, KeyError):
+        return {"classification": "unknown"}
+
+
 def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tuple[bool, str]:
     """Verify cartridge against its manifest. Returns (ok, message)."""
     try:
@@ -6445,7 +6536,13 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
             marker = save_path + ".pending"
             marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
             try:
-                data = b"membot-pair-publication-pending-v1\n"
+                before = ({"cartridge": mounted_revision[0], "manifest": mounted_revision[1]}
+                          if in_place else {"cartridge": None, "manifest": None})
+                marker_data = {"schema": "membot-pair-pending-v2", "target": os.path.basename(save_path),
+                               "before": before,
+                               "intended": {"cartridge": manifest["content_sha256"],
+                                            "manifest": expected_manifest_hash}}
+                data = (json.dumps(marker_data, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
                 while data:
                     n = os.write(marker_fd, data)
                     if n <= 0:
