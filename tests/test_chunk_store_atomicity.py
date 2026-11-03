@@ -1118,6 +1118,56 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertFalse(os.path.exists(cart), "partial new pair remains without recovery")
             self.assertFalse(os.path.exists(manifest))
 
+    def test_new_partial_pair_must_not_mount_as_legacy(self):
+        reader_sid = "partial-pair-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("synthetic partial", session_id=self.sid)
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            actual_link = os.link
+
+            def fail_manifest(source, destination, **kwargs):
+                if destination == manifest:
+                    raise OSError("synthetic manifest failure")
+                return actual_link(source, destination, **kwargs)
+
+            with patch.object(M.os, "link", side_effect=fail_manifest):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            self.assertTrue(os.path.isfile(cart))
+            self.assertFalse(os.path.exists(manifest))
+            mounted = M.mount_cartridge("test", session_id=reader_sid)
+            self.assertFalse(mounted.startswith("Mounted"), mounted)
+            self.assertEqual(M._get_session(reader_sid)["texts"], [])
+
+    def test_existing_split_pair_is_refused_by_manifest_verification(self):
+        reader_sid = "split-pair-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M.memory_store("new", session_id=self.sid)
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            actual_replace = os.replace
+
+            def fail_manifest(source, destination):
+                if destination == manifest:
+                    raise OSError("synthetic manifest failure")
+                return actual_replace(source, destination)
+
+            with patch.object(M.os, "replace", side_effect=fail_manifest):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            mounted = M.mount_cartridge("test", session_id=reader_sid)
+            self.assertIn("SECURITY", mounted)
+            self.assertEqual(M._get_session(reader_sid)["texts"], [])
+
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
