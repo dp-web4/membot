@@ -1364,6 +1364,71 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
                 self.assertIn("SECURITY", mounted)
                 self.assertEqual(M._get_session(reader_sid)["texts"], [])
 
+    def test_read_only_pending_inspection_distinguishes_before_mixed_and_intended(self):
+        for cut, expected in (("before", "matches_before"), ("mixed", "mixed"),
+                              ("intended", "matches_intended")):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(M, "BASE_DIR", temp), patch.object(M, "embed_text", fake_embed):
+                M._sessions.pop(self.sid, None)
+                self.state = M._get_session(self.sid)
+                self.state["cartridge_name"] = "test"
+                M.memory_store("synthetic seed", session_id=self.sid)
+                self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+                M.memory_store("synthetic later", session_id=self.sid)
+                cart = os.path.join(temp, "cartridges", "test.cart.npz")
+                manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+                original_replace = os.replace
+                actual_sync = M._sync_pair_directory
+                sync_calls = 0
+
+                def fail_sync(directory):
+                    nonlocal sync_calls
+                    sync_calls += 1
+                    if (cut == "before" and sync_calls == 1) or (cut == "intended" and sync_calls == 2):
+                        raise OSError("synthetic sync failure")
+                    return actual_sync(directory)
+
+                def fail_manifest(src, dst):
+                    if cut == "mixed" and dst == manifest:
+                        raise OSError("synthetic manifest failure")
+                    return original_replace(src, dst)
+
+                with patch.object(M, "_sync_pair_directory", side_effect=fail_sync), \
+                        patch.object(M.os, "replace", side_effect=fail_manifest):
+                    self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Save outcome unknown"))
+                marker = cart + ".pending"
+                with open(marker, "rb") as stream:
+                    marker_before = stream.read()
+                with open(cart, "rb") as stream:
+                    cart_before = stream.read()
+                with open(manifest, "rb") as stream:
+                    manifest_before = stream.read()
+                with patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")):
+                    result = M._inspect_pending_pair(cart)
+                self.assertEqual(result.get("classification"), expected, result)
+                self.assertNotIn("synthetic seed", repr(result))
+                self.assertTrue(os.path.exists(marker))
+                with open(marker, "rb") as stream:
+                    self.assertEqual(stream.read(), marker_before)
+                with open(cart, "rb") as stream:
+                    self.assertEqual(stream.read(), cart_before)
+                with open(manifest, "rb") as stream:
+                    self.assertEqual(stream.read(), manifest_before)
+
+    def test_pending_inspection_is_conservative_for_bad_or_missing_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cart = os.path.join(temp, "synthetic.cart.npz")
+            self.assertEqual(M._inspect_pending_pair(cart).get("classification"), "no_marker")
+            marker = cart + ".pending"
+            for payload in (b"truncated", b'{"schema":"a","schema":"b"}', b"x" * 8193):
+                with open(marker, "wb") as stream:
+                    stream.write(payload)
+                os.chmod(marker, 0o600)
+                with patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")):
+                    result = M._inspect_pending_pair(cart)
+                self.assertEqual(result.get("classification"), "unknown", result)
+                self.assertTrue(os.path.exists(marker))
+
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
