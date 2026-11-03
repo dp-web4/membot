@@ -975,6 +975,44 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertEqual((current_cart, current_manifest), (original_cart, original_manifest),
                              "a failed pair publication left the two files split")
 
+    def test_manifest_failure_after_cart_publish_reports_unknown_and_keeps_dirty(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(path, "rb") as stream:
+                original = stream.read()
+            M.memory_store("new memory", session_id=self.sid)
+            with patch.object(M, "save_manifest", side_effect=OSError("synthetic manifest failure")):
+                outcome = M.save_cartridge(session_id=self.sid)
+            with open(path, "rb") as stream:
+                self.assertNotEqual(stream.read(), original)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            self.assertTrue(self.state["modified"])
+
+    def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M.memory_store("new memory", session_id=self.sid)
+            actual_revision = M._cartridge_pair_revision
+            calls = 0
+
+            def fail_after_publish(path):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic revision failure")
+                return actual_revision(path)
+
+            with patch.object(M, "_cartridge_pair_revision", side_effect=fail_after_publish):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertEqual(calls, 2)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            self.assertTrue(self.state["modified"])
+
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
         release = threading.Event()
