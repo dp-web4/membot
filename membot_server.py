@@ -2574,7 +2574,16 @@ async def rest_save(request: Request) -> JSONResponse:
         # save_cartridge(name="", session_id="") — pass the body through so a
         # REST caller can name a new cartridge (previously ignored). Mirrors rest_mount.
         result = _call(name=name, session_id=session_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        # This legacy tool returns text, not a typed result. Only its explicit
+        # success prefix is success; uncertainty is not a failed/no-op save.
+        if isinstance(result, str) and result.startswith("Saved '"):
+            status, code = "ok", 200
+        elif isinstance(result, str) and result.startswith("Save outcome unknown"):
+            status, code = "unknown", 500
+        else:
+            status, code = "error", 409
+        return JSONResponse({"status": status, "result": result}, status_code=code,
+                            headers=_cors_headers())
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
@@ -6192,6 +6201,9 @@ def save_cartridge(name: str = "", session_id: str = "") -> str:
             except _CartridgeLockTimeout:
                 return "Save not started: a cooperating cartridge lock remained busy; retry after checking the writer."
             except OSError as exc:
+                # This may be an acquisition error or a release error after a
+                # successful publication; preserve uncertainty either way.
+                state["modified"] = True
                 return (f"Save outcome unknown: cartridge lock unavailable or release failed ({exc}); "
                         "inspect the destination before retrying.")
 
@@ -6250,6 +6262,7 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
 
     save_path = os.path.join(save_dir, f"{save_name}.cart.npz")
 
+    publication_started = False
     try:
         # A different existing destination is not this mounted cartridge: do
         # not put its authority on the source contents, or overwrite it.
@@ -6318,6 +6331,9 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         has_hippo = "hippocampus.npy" in extras
         if previous and "has_hippocampus" in previous and previous["has_hippocampus"] != has_hippo:
             return "Save error: manifest and cartridge disagree about hippocampus metadata."
+        # This operation can publish before returning an error. Once it has
+        # started, no exception proves that the destination is unchanged.
+        publication_started = True
         save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"),
                     version=version, extra_members=extras)
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
@@ -6351,6 +6367,12 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         )
 
     except Exception as e:
+        if publication_started:
+            # Do not claim a clean session after an uncertain publication;
+            # inspecting/reconciling the pair must precede any retry.
+            log.error("Save outcome unknown after publication began: %s", e)
+            state["modified"] = True
+            return "Save outcome unknown: inspect the cartridge and manifest before retrying."
         log.error(f"Save error: {e}")
         return f"Save error: {e}"
 

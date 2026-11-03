@@ -3,6 +3,7 @@
 These tests use only synthetic session state and temporary cartridges. They do
 not connect to an embedder, an MCP server, or a remote persistence service.
 """
+import asyncio
 import json
 import multiprocessing
 import os
@@ -1012,6 +1013,45 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertEqual(calls, 2)
             self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
             self.assertTrue(self.state["modified"])
+
+    def test_lock_release_failure_after_success_keeps_session_dirty(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def fail_release(paths):
+            yield
+            raise OSError("synthetic release failure")
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M.memory_store("new memory", session_id=self.sid)
+            with patch.object(M, "_cooperating_cartridge_locks", fail_release):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            self.assertTrue(self.state["modified"], "unknown must not clear the dirty state")
+
+    def test_rest_save_does_not_label_unknown_or_refused_outcomes_as_success(self):
+        class FakeRequest:
+            method = "POST"
+
+            async def body(self):
+                return b"{}"
+
+            async def json(self):
+                return {}
+
+        for outcome, expected in (("Saved 'test': 1 memories", "ok"),
+                                  ("Save outcome unknown: inspect before retrying.", "unknown"),
+                                  ("Save error: source changed", "error"),
+                                  ("Server is in read-only mode.", "error")):
+            with self.subTest(outcome=outcome), patch.object(M, "save_cartridge", new=lambda **kwargs: outcome):
+                response = asyncio.run(M.rest_save(FakeRequest()))
+                body = json.loads(response.body)
+                self.assertEqual(body["status"], expected)
+                self.assertEqual(body["result"], outcome)
+                self.assertEqual(response.status_code < 400, expected == "ok")
 
     def test_overlapping_stores_cannot_publish_misaligned_groups(self):
         entered = threading.Event()
