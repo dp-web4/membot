@@ -1168,6 +1168,23 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertIn("SECURITY", mounted)
             self.assertEqual(M._get_session(reader_sid)["texts"], [])
 
+    def test_pending_pair_must_be_refused_before_cartridge_deserialization(self):
+        reader_sid = "pending-pair-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(cart + ".pending", "wb") as stream:
+                stream.write(b"synthetic pending marker")
+            with patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")) as load:
+                mounted = M.mount_cartridge("test", session_id=reader_sid)
+            load.assert_not_called()
+            self.assertIn("SECURITY", mounted)
+            self.assertEqual(M._get_session(reader_sid)["texts"], [])
+
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
