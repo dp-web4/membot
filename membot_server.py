@@ -302,8 +302,22 @@ def load_manifest(cart_path: str) -> dict | None:
         return None
 
 
+def _pair_publication_pending(cart_path: str) -> bool:
+    """Treat any marker, including a symlink or malformed file, as pending."""
+    try:
+        os.lstat(cart_path + ".pending")
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def verify_manifest(cart_path: str, embeddings: np.ndarray, n_texts: int) -> tuple[bool, str]:
     """Verify cartridge against its manifest. Returns (ok, message)."""
+    try:
+        if _pair_publication_pending(cart_path):
+            return False, "cartridge publication pending or outcome unknown"
+    except OSError:
+        return False, "cartridge publication status unavailable"
     manifest_path = cart_path.rsplit(".", 1)[0] + "_manifest.json"
     if not os.path.exists(manifest_path):
         return True, "no manifest (legacy cartridge)"
@@ -5054,6 +5068,8 @@ def _mount_cartridge_locked(name: str, session_id: str, owner_id: str, state: di
 
     try:
         t0 = time.time()
+        if not cart.get("mempack_id") and _pair_publication_pending(cart["path"]):
+            return f"SECURITY: Cartridge '{cart['name']}' has a pending publication. Refusing to mount."
         data = load_cartridge_safe(cart["path"])
 
         embeddings = data["embeddings"]
@@ -5074,6 +5090,8 @@ def _mount_cartridge_locked(name: str, session_id: str, owner_id: str, state: di
                 return f"SECURITY: Cartridge '{cart['name']}' failed integrity check: {verify_msg}. Refusing to mount."
 
         mounted_revision = _cartridge_pair_revision(cart["path"])
+        if not cart.get("mempack_id") and _pair_publication_pending(cart["path"]):
+            return f"SECURITY: Cartridge '{cart['name']}' has a pending publication. Refusing to mount."
         state["embeddings"] = embeddings
         state["texts"] = texts
         state["mounted_texts"] = tuple(texts)
@@ -6285,6 +6303,29 @@ def _preserve_manifest_security(source: str, staged: str) -> None:
         os.close(source_fd)
 
 
+def _sync_pair_file(path: str) -> None:
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("pair publication requires POSIX no-follow support")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("refusing to sync an unsafe staged file")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _sync_pair_directory(path: str) -> None:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        raise ValueError("pair publication requires directory fsync support")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
     log.info(f"save_cartridge('{name}', session={session_id})")
 
@@ -6309,6 +6350,8 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         # A different existing destination is not this mounted cartridge: do
         # not put its authority on the source contents, or overwrite it.
         source = state.get("cartridge_path")
+        if _pair_publication_pending(save_path) or (source and _pair_publication_pending(source)):
+            return "Save error: a prior cartridge publication is pending; inspect before retrying."
         in_place = bool(source and os.path.realpath(source) == os.path.realpath(save_path))
         if not in_place and (os.path.exists(save_path) or
                              os.path.exists(save_path.rsplit(".", 1)[0] + "_manifest.json")):
@@ -6388,18 +6431,47 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
                                      **retained)
             if in_place and os.path.lexists(destination_manifest):
                 _preserve_manifest_security(destination_manifest, staged_manifest)
+            _sync_pair_file(staged_cart)
+            _sync_pair_file(staged_manifest)
+            expected_manifest_hash = _cartridge_sha256(staged_manifest)
             # Detect intervening nonparticipating writes before publication;
             # this check is not atomic with the later two replacements.
             if source and _cartridge_pair_revision(source) != mounted_revision:
                 return "Save error: mounted source changed during staging; remount before saving."
+            # Publish a durable fail-closed marker first. An interrupted commit
+            # is visible to participating readers; marker presence is not a
+            # recovery protocol and is not protected from same-user tampering.
             publication_started = True
-            if in_place:
-                os.replace(staged_cart, save_path)
-                os.replace(staged_manifest, destination_manifest)
-            else:
-                # Never intentionally overwrite a newly appearing destination.
-                os.link(staged_cart, save_path, follow_symlinks=False)
-                os.link(staged_manifest, destination_manifest, follow_symlinks=False)
+            marker = save_path + ".pending"
+            marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                data = b"membot-pair-publication-pending-v1\n"
+                while data:
+                    n = os.write(marker_fd, data)
+                    if n <= 0:
+                        raise OSError("failed to write publication marker")
+                    data = data[n:]
+                os.fsync(marker_fd)
+                _sync_pair_directory(save_dir)
+                if in_place:
+                    os.replace(staged_cart, save_path)
+                    os.replace(staged_manifest, destination_manifest)
+                else:
+                    # Never intentionally overwrite a newly appearing destination.
+                    os.link(staged_cart, save_path, follow_symlinks=False)
+                    os.link(staged_manifest, destination_manifest, follow_symlinks=False)
+                if (_cartridge_sha256(save_path) != manifest["content_sha256"] or
+                        _cartridge_sha256(destination_manifest) != expected_manifest_hash):
+                    raise ValueError("published cartridge pair did not match staged artifacts")
+                _sync_pair_directory(save_dir)
+                by_fd, by_name = os.fstat(marker_fd), os.lstat(marker)
+                if ((by_fd.st_dev, by_fd.st_ino) != (by_name.st_dev, by_name.st_ino) or
+                        not stat.S_ISREG(by_name.st_mode) or by_name.st_nlink != 1):
+                    raise ValueError("publication marker changed before completion")
+                os.unlink(marker)
+                _sync_pair_directory(save_dir)
+            finally:
+                os.close(marker_fd)
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
         state["modified"] = False
         if source is None and save_name == state["cartridge_name"]:

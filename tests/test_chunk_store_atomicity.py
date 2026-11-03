@@ -1185,6 +1185,185 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertIn("SECURITY", mounted)
             self.assertEqual(M._get_session(reader_sid)["texts"], [])
 
+    def test_marker_appearing_after_initial_check_prevents_deserialization(self):
+        reader_sid = "racing-deserialize-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            check = M._pair_publication_pending
+            calls = 0
+
+            def marker_after_first_check(path):
+                nonlocal calls
+                result = check(path)
+                calls += 1
+                if calls == 1:
+                    with open(cart + ".pending", "wb") as stream:
+                        stream.write(b"synthetic pending")
+                return result
+
+            with patch.object(M, "_pair_publication_pending", side_effect=marker_after_first_check), \
+                    patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")) as load:
+                M.mount_cartridge("test", session_id=reader_sid)
+            load.assert_not_called()
+
+    def test_successful_pair_publication_clears_its_marker(self):
+        reader_sid = "completed-pair-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            self.assertFalse(os.path.lexists(cart + ".pending"))
+            M.memory_store("new", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            self.assertFalse(os.path.lexists(cart + ".pending"))
+            self.assertTrue(M.mount_cartridge("test", session_id=reader_sid).startswith("Mounted"))
+
+    def test_marker_sync_failure_leaves_old_pair_and_blocks_mount(self):
+        reader_sid = "marker-sync-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            with open(cart, "rb") as stream:
+                old_cart = stream.read()
+            with open(manifest, "rb") as stream:
+                old_manifest = stream.read()
+            M.memory_store("new", session_id=self.sid)
+            with patch.object(M, "_sync_pair_directory", side_effect=OSError("synthetic sync failure")):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            marker = cart + ".pending"
+            self.assertTrue(os.path.isfile(marker))
+            self.assertEqual(stat.S_IMODE(os.stat(marker).st_mode) & 0o077, 0)
+            with open(cart, "rb") as stream:
+                self.assertEqual(stream.read(), old_cart)
+            with open(manifest, "rb") as stream:
+                self.assertEqual(stream.read(), old_manifest)
+            self.assertIn("SECURITY", M.mount_cartridge("test", session_id=reader_sid))
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support required")
+    def test_pending_symlink_is_not_followed_and_blocks_mount(self):
+        reader_sid = "marker-symlink-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            os.symlink("nonexistent", cart + ".pending")
+            with patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")) as load:
+                mounted = M.mount_cartridge("test", session_id=reader_sid)
+            load.assert_not_called()
+            self.assertIn("SECURITY", mounted)
+
+    def test_pending_marker_blocks_save_without_removing_it(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(cart, "rb") as stream:
+                old_cart = stream.read()
+            marker = cart + ".pending"
+            with open(marker, "wb") as stream:
+                stream.write(b"synthetic pending")
+            M.memory_store("new", session_id=self.sid)
+            result = M.save_cartridge(session_id=self.sid)
+            self.assertFalse(result.startswith("Saved"))
+            with open(marker, "rb") as stream:
+                self.assertEqual(stream.read(), b"synthetic pending")
+            with open(cart, "rb") as stream:
+                self.assertEqual(stream.read(), old_cart)
+
+    def test_marker_created_during_read_is_checked_before_mount_commit(self):
+        reader_sid = "racing-pair-reader"
+        self.addCleanup(M._sessions.pop, reader_sid, None)
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            actual_revision = M._cartridge_pair_revision
+
+            def marker_after_read(path):
+                revision = actual_revision(path)
+                with open(cart + ".pending", "wb") as stream:
+                    stream.write(b"synthetic pending")
+                return revision
+
+            with patch.object(M, "_cartridge_pair_revision", side_effect=marker_after_read):
+                mounted = M.mount_cartridge("test", session_id=reader_sid)
+            self.assertIn("SECURITY", mounted)
+            self.assertEqual(M._get_session(reader_sid)["texts"], [])
+
+    @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
+    def test_process_exit_between_pair_publications_blocks_mount_for_new_and_existing(self):
+        context = multiprocessing.get_context("fork")
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as temp, \
+                    patch.object(M, "BASE_DIR", temp), \
+                    patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                    patch.object(M, "embed_text", fake_embed):
+                M._sessions.pop(self.sid, None)
+                self.state = M._get_session(self.sid)
+                self.state["cartridge_name"] = "test"
+                M.memory_store("seed", session_id=self.sid)
+                if existing:
+                    self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+                    M.memory_store("new", session_id=self.sid)
+                cart = os.path.join(temp, "cartridges", "test.cart.npz")
+                manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+
+                def child():
+                    real_replace, real_link = os.replace, os.link
+
+                    def stop_before_manifest_replace(src, dst):
+                        if dst == manifest:
+                            os._exit(73)
+                        return real_replace(src, dst)
+
+                    def stop_before_manifest_link(src, dst, **kwargs):
+                        if dst == manifest:
+                            os._exit(73)
+                        return real_link(src, dst, **kwargs)
+
+                    with patch.object(M.os, "replace", side_effect=stop_before_manifest_replace), \
+                            patch.object(M.os, "link", side_effect=stop_before_manifest_link):
+                        M.save_cartridge(session_id=self.sid)
+                    os._exit(74)  # The intended interruption was not reached.
+
+                process = context.Process(target=child)
+                process.start()
+                process.join(10)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                    self.fail("synthetic writer did not exit")
+                self.assertEqual(process.exitcode, 73)
+                self.assertTrue(os.path.exists(cart + ".pending"))
+                reader_sid = "process-exit-reader"
+                M._sessions.pop(reader_sid, None)
+                self.addCleanup(M._sessions.pop, reader_sid, None)
+                with patch.object(M, "load_cartridge_safe", side_effect=AssertionError("must not deserialize")) as load:
+                    mounted = M.mount_cartridge("test", session_id=reader_sid)
+                load.assert_not_called()
+                self.assertIn("SECURITY", mounted)
+                self.assertEqual(M._get_session(reader_sid)["texts"], [])
+
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
