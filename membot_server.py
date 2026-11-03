@@ -51,6 +51,7 @@ import hashlib
 import pickle
 import sqlite3
 import stat
+import tempfile
 import zlib
 import time
 import base64
@@ -1627,7 +1628,7 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern_meta=None,
-                *, version="mcp-v3", extra_members=None):
+                *, version="mcp-v3", extra_members=None, metadata_from=None):
     """Write a cartridge; legacy object arrays are not safe to load from untrusted inputs."""
     if embeddings is None:
         if texts:
@@ -1648,16 +1649,17 @@ def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str], per_pattern
     # sidecar still needs a recoverable cross-file transaction.
     existing = None
     prior_attrs = None
-    if os.path.lexists(path):
-        existing = os.lstat(path)
+    metadata_path = metadata_from if metadata_from is not None else path
+    if os.path.lexists(metadata_path):
+        existing = os.lstat(metadata_path)
         if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
             raise ValueError("refusing to replace a non-regular or multiply linked cartridge")
         if hasattr(os, "geteuid") and existing.st_uid != os.geteuid():
             raise ValueError("refusing to replace a cartridge owned by another user")
         if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr", "removexattr")):
             raise ValueError("cannot verify cartridge extended attributes on this platform")
-        prior_attrs = {key: os.getxattr(path, key, follow_symlinks=False)
-                       for key in os.listxattr(path, follow_symlinks=False)}
+        prior_attrs = {key: os.getxattr(metadata_path, key, follow_symlinks=False)
+                       for key in os.listxattr(metadata_path, follow_symlinks=False)}
     # O_EXCL prevents reuse of an attacker-created name, and new files use 0666
     # filtered by the process umask, as before. A .tmp
     # suffix keeps in-progress files out of cartridge discovery.
@@ -6243,6 +6245,46 @@ def _preserved_cart_members(source: str, n_texts: int):
     return version, extras
 
 
+def _preserve_manifest_security(source: str, staged: str) -> None:
+    """Preserve existing sidecar security metadata, or refuse publication.
+
+    Descriptor checks do not protect against hostile same-user ancestor or
+    later path replacement, and this is not a cross-platform ACL guarantee.
+    """
+    if not all(hasattr(os, name) for name in
+               ("O_NOFOLLOW", "listxattr", "getxattr", "setxattr", "removexattr", "geteuid")):
+        raise ValueError("cannot verify manifest metadata on this platform")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+    source_fd = os.open(source, flags)
+    try:
+        source_stat = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1 or
+                source_stat.st_uid != os.geteuid()):
+            raise ValueError("refusing unsafe existing manifest")
+        attrs = {key: os.getxattr(source_fd, key) for key in os.listxattr(source_fd)}
+        staged_fd = os.open(staged, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        try:
+            staged_stat = os.fstat(staged_fd)
+            if not stat.S_ISREG(staged_stat.st_mode) or staged_stat.st_nlink != 1:
+                raise ValueError("refusing unsafe staged manifest")
+            if (staged_stat.st_uid, staged_stat.st_gid) != (source_stat.st_uid, source_stat.st_gid):
+                os.fchown(staged_fd, source_stat.st_uid, source_stat.st_gid)
+            for key in set(os.listxattr(staged_fd)) - set(attrs):
+                os.removexattr(staged_fd, key)
+            for key, value in attrs.items():
+                os.setxattr(staged_fd, key, value)
+            os.fchmod(staged_fd, stat.S_IMODE(source_stat.st_mode))
+            result = os.fstat(staged_fd)
+            copied = {key: os.getxattr(staged_fd, key) for key in os.listxattr(staged_fd)}
+            if ((result.st_uid, result.st_gid, stat.S_IMODE(result.st_mode)) !=
+                    (source_stat.st_uid, source_stat.st_gid, stat.S_IMODE(source_stat.st_mode)) or copied != attrs):
+                raise ValueError("cannot preserve manifest ownership, mode and extended attributes")
+        finally:
+            os.close(staged_fd)
+    finally:
+        os.close(source_fd)
+
+
 def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
     log.info(f"save_cartridge('{name}', session={session_id})")
 
@@ -6331,18 +6373,34 @@ def _save_cartridge_locked(name: str, session_id: str, state: dict) -> str:
         has_hippo = "hippocampus.npy" in extras
         if previous and "has_hippocampus" in previous and previous["has_hippocampus"] != has_hippo:
             return "Save error: manifest and cartridge disagree about hippocampus metadata."
-        # This operation can publish before returning an error. Once it has
-        # started, no exception proves that the destination is unchanged.
-        publication_started = True
-        save_as_npz(save_path, state["embeddings"], state["texts"], state.get("per_pattern_meta"),
-                    version=version, extra_members=extras)
+        # Prepare both artifacts before touching either destination. This
+        # narrows failures but two names still cannot be published atomically.
+        destination_manifest = save_path.rsplit(".", 1)[0] + "_manifest.json"
+        with tempfile.TemporaryDirectory(prefix=".membot-stage-", dir=save_dir) as staging:
+            staged_cart = os.path.join(staging, "candidate.cart.npz")
+            staged_manifest = staged_cart.rsplit(".", 1)[0] + "_manifest.json"
+            save_as_npz(staged_cart, state["embeddings"], state["texts"], state.get("per_pattern_meta"),
+                        version=version, extra_members=extras,
+                        metadata_from=save_path if in_place else None)
+            manifest = save_manifest(staged_cart, state["embeddings"], len(state["texts"]), version=version,
+                                     has_hippocampus=has_hippo if has_hippo or (previous and "has_hippocampus" in previous) else None,
+                                     rebuilt_by="membot.save_cartridge" if previous and "rebuilt_by" in previous else None,
+                                     **retained)
+            if in_place and os.path.lexists(destination_manifest):
+                _preserve_manifest_security(destination_manifest, staged_manifest)
+            # Detect intervening nonparticipating writes before publication;
+            # this check is not atomic with the later two replacements.
+            if source and _cartridge_pair_revision(source) != mounted_revision:
+                return "Save error: mounted source changed during staging; remount before saving."
+            publication_started = True
+            if in_place:
+                os.replace(staged_cart, save_path)
+                os.replace(staged_manifest, destination_manifest)
+            else:
+                # Never intentionally overwrite a newly appearing destination.
+                os.link(staged_cart, save_path, follow_symlinks=False)
+                os.link(staged_manifest, destination_manifest, follow_symlinks=False)
         size_mb = os.path.getsize(save_path) / (1024 * 1024)
-
-        # Save integrity manifest
-        manifest = save_manifest(save_path, state["embeddings"], len(state["texts"]), version=version,
-                                 has_hippocampus=has_hippo if has_hippo or (previous and "has_hippocampus" in previous) else None,
-                                 rebuilt_by="membot.save_cartridge" if previous and "rebuilt_by" in previous else None,
-                                 **retained)
         state["modified"] = False
         if source is None and save_name == state["cartridge_name"]:
             state["cartridge_path"] = save_path

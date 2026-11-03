@@ -494,6 +494,47 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             self.assertEqual(os.getxattr(path, "user.membot_test"), b"synthetic")
 
     @unittest.skipUnless(all(hasattr(os, name) for name in ("setxattr", "getxattr")), "xattrs unavailable")
+    def test_staged_save_preserves_manifest_mode_and_extended_attributes(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            os.chmod(manifest, 0o600)
+            try:
+                os.setxattr(manifest, "user.membot_test", b"synthetic")
+            except OSError as exc:
+                self.skipTest(f"user xattrs unavailable: {exc}")
+            M.memory_store("new", session_id=self.sid)
+            outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Saved"), outcome)
+            self.assertEqual(stat.S_IMODE(os.stat(manifest).st_mode), 0o600)
+            self.assertEqual(os.getxattr(manifest, "user.membot_test"), b"synthetic")
+
+    def test_staged_manifest_metadata_failure_preserves_old_pair(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            with open(cart, "rb") as stream:
+                old_cart = stream.read()
+            with open(manifest, "rb") as stream:
+                old_manifest = stream.read()
+            M.memory_store("new", session_id=self.sid)
+            with patch.object(M, "_preserve_manifest_security", side_effect=OSError("synthetic")):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertFalse(outcome.startswith("Saved"))
+            with open(cart, "rb") as stream:
+                self.assertEqual(stream.read(), old_cart)
+            with open(manifest, "rb") as stream:
+                self.assertEqual(stream.read(), old_manifest)
+            self.assertFalse(any(name.startswith(".membot-stage-")
+                                 for name in os.listdir(os.path.dirname(cart))))
+
+    @unittest.skipUnless(all(hasattr(os, name) for name in ("setxattr", "getxattr")), "xattrs unavailable")
     def test_xattr_copy_failure_does_not_replace_existing_cartridge(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
                 patch.object(M, "embed_text", fake_embed):
@@ -748,6 +789,36 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             saved = M.load_cartridge_safe(path)
             self.assertTrue(not outcome.startswith("Saved") or "external writer" in saved["texts"], outcome)
 
+    def test_direct_writer_after_final_revision_check_is_not_silently_lost(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "CARTRIDGE_DIRS", [os.path.join(temp, "cartridges")]), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            M._sessions.pop(self.sid)
+            self.assertNotIn("SECURITY", M.mount_cartridge("test", session_id=self.sid))
+            M.memory_store("session edit", session_id=self.sid)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            old = M.load_cartridge_safe(path)
+            external_texts = list(old["texts"]) + ["external writer"]
+            external_embeddings = np.vstack([old["embeddings"], fake_embed("external writer")])
+            original_replace = os.replace
+            injected = False
+
+            def late_writer(source, destination):
+                nonlocal injected
+                if destination == path and not injected:
+                    injected = True
+                    M.save_as_npz(path, external_embeddings, external_texts)
+                    M.save_manifest(path, external_embeddings, len(external_texts))
+                return original_replace(source, destination)
+
+            with patch.object(M.os, "replace", side_effect=late_writer):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(injected)
+            saved = M.load_cartridge_safe(path)
+            self.assertTrue(not outcome.startswith("Saved") or "external writer" in saved["texts"], outcome)
+
     @unittest.skipUnless("fork" in multiprocessing.get_all_start_methods(), "requires fork")
     def test_cross_process_saves_cannot_both_succeed_after_stale_preflight(self):
         other_sid = "chunk-atomicity-process"
@@ -985,12 +1056,67 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             with open(path, "rb") as stream:
                 original = stream.read()
             M.memory_store("new memory", session_id=self.sid)
-            with patch.object(M, "save_manifest", side_effect=OSError("synthetic manifest failure")):
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            actual_replace = os.replace
+
+            def fail_manifest_publish(source, destination):
+                if destination == manifest_path:
+                    raise OSError("synthetic manifest publication failure")
+                return actual_replace(source, destination)
+
+            with patch.object(M.os, "replace", side_effect=fail_manifest_publish):
                 outcome = M.save_cartridge(session_id=self.sid)
             with open(path, "rb") as stream:
                 self.assertNotEqual(stream.read(), original)
             self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
             self.assertTrue(self.state["modified"])
+
+    def test_second_publication_failure_does_not_leave_a_split_pair(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest_path = path.rsplit(".", 1)[0] + "_manifest.json"
+            with open(path, "rb") as stream:
+                old_cart = stream.read()
+            with open(manifest_path, "rb") as stream:
+                old_manifest = stream.read()
+            M.memory_store("new memory", session_id=self.sid)
+            original_replace = os.replace
+
+            def fail_manifest(source, destination):
+                if destination == manifest_path:
+                    raise OSError("synthetic second publication failure")
+                return original_replace(source, destination)
+
+            with patch.object(M.os, "replace", side_effect=fail_manifest):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            with open(path, "rb") as stream:
+                cart = stream.read()
+            with open(manifest_path, "rb") as stream:
+                manifest = stream.read()
+            self.assertEqual((cart, manifest), (old_cart, old_manifest), "pair was left split")
+
+    def test_new_pair_second_publication_failure_does_not_leave_partial_destination(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
+                patch.object(M, "embed_text", fake_embed):
+            M.memory_store("seed", session_id=self.sid)
+            cart = os.path.join(temp, "cartridges", "test.cart.npz")
+            manifest = cart.rsplit(".", 1)[0] + "_manifest.json"
+            original_link = os.link
+
+            def fail_manifest(source, destination, **kwargs):
+                if destination == manifest:
+                    raise OSError("synthetic second publication failure")
+                return original_link(source, destination, **kwargs)
+
+            with patch.object(M.os, "link", side_effect=fail_manifest):
+                outcome = M.save_cartridge(session_id=self.sid)
+            self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
+            self.assertFalse(os.path.exists(cart), "partial new pair remains without recovery")
+            self.assertFalse(os.path.exists(manifest))
 
     def test_post_publish_revision_failure_reports_unknown_and_keeps_dirty(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(M, "BASE_DIR", temp), \
@@ -998,19 +1124,24 @@ class ChunkStoreAtomicityTests(unittest.TestCase):
             M.memory_store("seed", session_id=self.sid)
             self.assertTrue(M.save_cartridge(session_id=self.sid).startswith("Saved"))
             M.memory_store("new memory", session_id=self.sid)
+            path = os.path.join(temp, "cartridges", "test.cart.npz")
+            with open(path, "rb") as stream:
+                original = stream.read()
             actual_revision = M._cartridge_pair_revision
             calls = 0
 
             def fail_after_publish(path):
                 nonlocal calls
                 calls += 1
-                if calls == 2:
+                if calls == 3:
                     raise OSError("synthetic revision failure")
                 return actual_revision(path)
 
             with patch.object(M, "_cartridge_pair_revision", side_effect=fail_after_publish):
                 outcome = M.save_cartridge(session_id=self.sid)
-            self.assertEqual(calls, 2)
+            self.assertEqual(calls, 3)
+            with open(path, "rb") as stream:
+                self.assertNotEqual(stream.read(), original)
             self.assertTrue(outcome.startswith("Save outcome unknown"), outcome)
             self.assertTrue(self.state["modified"])
 
