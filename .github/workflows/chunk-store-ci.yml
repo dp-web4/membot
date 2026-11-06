@@ -1,0 +1,22 @@
+name: chunk-store-ci
+
+on:
+  pull_request:
+    paths:
+      - 'membot_server.py'
+      - 'cartridge_builder.py'
+      - 'tests/test_chunk_store_current.py'
+      - '.github/workflows/chunk-store-ci.yml'
+
+jobs:
+  chunk-store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install isolated test dependencies
+        run: python -m pip install 'pytest==9.0.3' 'numpy>=1.24,<3' 'fastmcp>=4,<5'
+      - name: Run chunk-on-store contract
+        run: python -m pytest -q tests/test_chunk_store_current.py
