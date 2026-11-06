@@ -111,6 +111,13 @@ RECENCY_HALF_LIFE = 86400.0   # 24h — recency weight halves per day (0 = disab
 MAX_ENTRIES = int(os.environ.get("MEMBOT_MAX_ENTRIES", 3_000_000))
 MAX_TEXT_LENGTH = int(os.environ.get("MEMBOT_MAX_TEXT_LENGTH", 10_000))
 MAX_QUERY_LENGTH = int(os.environ.get("MEMBOT_MAX_QUERY_LENGTH", 2_000))
+
+# Long local stores use the same passage splitter as cartridge ingestion, so recall can rank
+# and retrieve the relevant section rather than one embedding over an entire note. Mempacks
+# stay single-pattern until their remote persistence path has an atomic multi-pattern contract.
+CHUNK_STORE_MIN_CHARS = int(os.environ.get("MEMBOT_CHUNK_STORE_MIN_CHARS", 1200))
+CHUNK_STORE_WORDS = int(os.environ.get("MEMBOT_CHUNK_STORE_WORDS", 300))
+CHUNK_STORE_OVERLAP = int(os.environ.get("MEMBOT_CHUNK_STORE_OVERLAP", 50))
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
 
 
@@ -5749,14 +5756,35 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
         return f"mempack_update_pattern_i error: {e}"
 
 
+def _chunk_for_store(content: str) -> list[str]:
+    """Return the local passages one memory_store call should create.
+
+    Short input is byte-preserving. Long input uses the canonical cartridge builder splitter,
+    including explicit ---PASSAGE_BREAK--- boundaries. Failure is conservative: store the input
+    as one passage rather than lose it.
+    """
+    if len(content) <= CHUNK_STORE_MIN_CHARS and "---PASSAGE_BREAK---" not in content:
+        return [content]
+    try:
+        from cartridge_builder import chunk_text
+        chunks = chunk_text(content, CHUNK_STORE_WORDS, CHUNK_STORE_OVERLAP)
+        chunks = [chunk for chunk in chunks if chunk]
+        return chunks or [content]
+    except Exception as e:
+        log.warning(f"chunk-on-store unavailable ({e}); storing whole")
+        return [content]
+
+
 @mcp.tool()
 def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     """Store new text in the currently mounted cartridge.
-    The text is embedded via Nomic and added to the searchable memory.
-    If GPU is available, the pattern is also imprinted into the lattice.
+
+    Local cartridges split long content into overlapping passages using the same splitter as
+    cartridge ingestion. Mempacks remain one remote pattern per call until their persistence
+    surface has an atomic multi-pattern contract.
 
     Args:
-        content: Text content to memorize (max 10,000 chars)
+        content: Text content to memorize
         tags: Optional metadata tags (prepended to stored text)
         session_id: Session identifier (uses default session if empty)
     """
@@ -5769,110 +5797,96 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
 
-    # Read-only carve-out for Mempacks. The --read-only flag is about
-    # server-managed knowledge carts on droplet FS; Mempacks live in
-    # Supabase under the user's own row + bucket folder. Per-user writes
-    # to Mempacks should work even on the public read-only port.
     is_mempack = bool(state.get("mempack_id"))
     if _server_config.get("read_only") and not is_mempack:
         return "Server is in read-only mode. memory_store is disabled for non-Mempack carts."
 
+    pieces = [content] if is_mempack else _chunk_for_store(content)
+    n_pieces = len(pieces)
     n_current = len(state["texts"]) if state["texts"] else 0
-    if n_current >= MAX_ENTRIES:
-        return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
 
-    # Exact-dedup: refuse byte-identical re-stores. Clients (e.g. snarc's bridge)
-    # re-emit recurring patterns every session; storing the same entry twice only
-    # bloats the cartridge and pollutes recall. No-op skip, not an error.
-    stored_text = f"[{tags}] {content}" if tags else content
-    if state["texts"] and stored_text in state["texts"]:
-        return f"Duplicate — already stored, skipped: \"{content[:60]}\""
+    if n_current + n_pieces > MAX_ENTRIES:
+        return (
+            f"Cartridge full ({n_current}/{MAX_ENTRIES}); this entry needs {n_pieces} "
+            "passage(s). Save and start a new cartridge."
+        )
 
-    log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack})")
+    def passage(i: int) -> str:
+        part = f"(part {i + 1}/{n_pieces}) " if n_pieces > 1 else ""
+        body = f"{part}{pieces[i]}"
+        return f"[{tags}] {body}" if tags else body
+
+    stored = [passage(i) for i in range(n_pieces)]
+    present = [text in state["texts"] for text in stored] if state["texts"] else [False] * n_pieces
+    if all(present):
+        return f'Duplicate — already stored, skipped: "{content[:60]}"'
+    if any(present):
+        return (
+            "Partial duplicate — nothing stored: some passages from this exact split are already "
+            "present. Inspect or supersede the existing memory before retrying."
+        )
+
+    log.info(
+        f"memory_store('{content[:60]}...', is_mempack={is_mempack}, passages={n_pieces})"
+    )
 
     try:
         t0 = time.time()
 
-        # 1. Embed via Nomic
-        emb = embed_text(content, prefix="search_document")
+        # Prepare every embedding before mutating session state. A failed embedding therefore
+        # cannot leave half of a chunked memory in the cartridge.
+        embeddings = [embed_text(piece, prefix="search_document") for piece in pieces]
+        binary_rows = [(emb > 0).astype(np.uint8).reshape(1, -1) for emb in embeddings]
 
-        # 2. Add to embedding matrix
+        new_embeddings = np.vstack([emb.reshape(1, -1) for emb in embeddings])
+        new_binary = np.vstack(binary_rows)
         if state["embeddings"] is None or len(state["embeddings"]) == 0:
-            state["embeddings"] = emb.reshape(1, -1)
+            state["embeddings"] = new_embeddings
         else:
-            state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
-
-        # 3. Extend binary corpus (sign_zero for Hamming search)
-        new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
+            state["embeddings"] = np.vstack([state["embeddings"], new_embeddings])
         if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
-            state["binary_corpus"] = new_bin
+            state["binary_corpus"] = new_binary
         else:
-            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
+            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_binary])
 
-        # 4. Store text
-        stored_text = f"[{tags}] {content}" if tags else content
-        state["texts"].append(stored_text)
+        state["texts"].extend(stored)
         state["modified"] = True
+        state["has_embeddings"] = True
 
-        # 5. GPU lattice imprint (if available)
         gpu_msg = ""
         if _gpu_state["available"] and _gpu_state["lattice"] is not None:
             try:
                 ml = _gpu_state["lattice"]
-                ml.reset()
-                ml.imprint_vector(emb)
-                ml.settle(frames=10, learn=True)
+                for emb in embeddings:
+                    ml.reset()
+                    ml.imprint_vector(emb)
+                    ml.settle(frames=10, learn=True)
                 gpu_msg = " + lattice imprint"
             except Exception as e:
                 gpu_msg = f" (lattice failed: {e})"
                 log.warning(f"Lattice imprint failed: {e}")
 
-        # 6. Mempack persistence: if this is a Supabase-backed Mempack, round-trip
-        # the new pattern back to Storage + mempack_patterns. Last-writer-wins
-        # for v1; concurrent writes from two agents to the same Mempack are
-        # rare enough to defer optimistic-locking to v1.2.
         persist_msg = ""
         if state.get("mempack_id") and _supabase_available():
             try:
-                persist_msg = " + " + _mempack_persist_new_pattern(state, stored_text, emb)
+                # Mempacks are deliberately single-passage above, preserving today's remote
+                # one-call/one-pattern persistence contract.
+                persist_msg = " + " + _mempack_persist_new_pattern(
+                    state, stored[0], embeddings[0]
+                )
             except Exception as e:
                 persist_msg = f" (Mempack persistence FAILED: {e})"
                 log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
 
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
-
-        # SAY THE HANDLE THE READER WILL ACTUALLY USE.
-        #
-        # `#{n}` is the count AFTER appending, so it is effectively 1-based, while `search`
-        # reports `"index": int(i)` — the 0-based position in `state["texts"]`. The memory
-        # reported as "#338" is therefore addressable as `idx:337`, and the two numbers have
-        # never agreed.
-        #
-        # That was harmless while memories were read-only: nothing took a number and acted on
-        # it. cbp-being is about to get a supersede verb, and then "correct #338" would
-        # silently correct the memory stored AFTER the one it meant — wrong, in the one place
-        # where being wrong is worst, and invisible because both numbers look plausible.
-        # Found by GPT reviewing that verb before it shipped, and confirmed here in source.
-        #
-        # ADDITIVE ON PURPOSE. `#{n}` stays exactly as it was: every being's journal already
-        # cites these numbers ("Stored memory #140 (supersedes #138)" in legion-being's, for
-        # one), and renumbering would silently invalidate those back-references. The only
-        # programmatic consumer is a prefix check (`_STORED_NEW` in SAGE's hestia_dispatch)
-        # which never parses the number. So the receipt now also carries the addressable
-        # handle, printed in `search`'s own vocabulary so the two are visibly the same thing.
-        #
-        # A RANGE, NOT A NUMBER, because one store is not always one passage. Open PR #4
-        # (chunk-on-store) splits a long memory into several passages at CONSECUTIVE indices.
-        # Reporting `n - 1` would then name only the LAST chunk, and a supersede verb given
-        # that handle would retract the tail of a belief and leave its head standing — a
-        # subtler wrong than the off-by-one this fixes. `n_current` is the count before this
-        # store, so the span is derived rather than assumed and is correct both today (one
-        # passage: start == end) and after #4 lands.
         first = n_current if n > n_current else max(0, n - 1)
         handle = f"idx:{first}" if n - first <= 1 else f"idx:{first}-{n - 1}"
-        return (f"Stored memory #{n} ({handle})"
-                f"{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)")
+        parts = f", {n_pieces} passages" if n_pieces > 1 else ""
+        return (
+            f"Stored memory #{n} ({handle}{parts})"
+            f"{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
+        )
 
     except Exception as e:
         log.error(f"Store error: {e}")
