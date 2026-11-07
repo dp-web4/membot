@@ -44,7 +44,7 @@ def test_short_store_is_one_byte_preserving_passage(monkeypatch):
 def test_long_store_splits_into_consecutive_retrievable_passages(monkeypatch):
     monkeypatch.setattr(M, "embed_text", _embed)
     sid, st = _fresh("long")
-    text = ("alpha beta gamma delta " * 500).strip()
+    text = ("alpha beta gamma delta " * 350).strip()
     out = M.memory_store(text, tags="memo", session_id=sid)
     assert len(st["texts"]) > 1
     n = len(st["texts"])
@@ -72,7 +72,7 @@ def test_embedding_failure_mutates_nothing(monkeypatch):
             raise RuntimeError("synthetic embed failure")
         return _embed(text, prefix)
     monkeypatch.setattr(M, "embed_text", fail_second)
-    text = ("alpha beta gamma delta " * 500).strip()
+    text = ("alpha beta gamma delta " * 350).strip()
     out = M.memory_store(text, session_id=sid)
     assert out.startswith("Store error:")
     assert st["texts"] == []
@@ -99,7 +99,7 @@ def test_capacity_preflight_stores_no_partial_entry(monkeypatch):
 def test_exact_duplicate_skips_and_partial_duplicate_refuses(monkeypatch):
     monkeypatch.setattr(M, "embed_text", _embed)
     sid, st = _fresh("dedup")
-    text = ("red green blue yellow " * 500).strip()
+    text = ("red green blue yellow " * 350).strip()
     first = M.memory_store(text, session_id=sid)
     count = len(st["texts"])
     assert count > 1 and "Stored memory #" in first
