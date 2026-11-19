@@ -13,7 +13,9 @@ Architecture:
   - Compatible with Vector Plus Studio v8.3 cartridge format (.npz/.pkl)
 
 Security:
-  - New cartridges saved as NPZ (no code execution risk)
+  - New cartridges saved as NPZ. NOT a code-execution boundary: the NPZ reader opens archives
+    with np.load(allow_pickle=True), so an object array in a hostile .npz unpickles on load.
+    Load only carts you trust until the loader refuses object arrays (upstream gauntlet, gate 1).
   - Legacy .pkl loading restricted to trusted directories only
   - SHA256 manifest for cartridge integrity verification
   - Cartridge name sanitization (no path traversal)
@@ -1219,9 +1221,12 @@ def find_cartridges() -> list[dict]:
 
 
 def load_cartridge_safe(path: str) -> dict:
-    """Load a cartridge using the safest available method.
+    """Load a cartridge by extension.
 
-    NPZ files are always safe (no code execution).
+    NPZ files are NOT checked against the trusted directories, and they are NOT safe: the NPZ
+    reader passes allow_pickle=True, so an object array in the archive unpickles (code execution).
+    This docstring used to say "NPZ files are always safe (no code execution)". That claim is why
+    .pkl got a trusted-directory gate and .npz did not (Waving Cat, 2026-11-09).
     PKL files are only loaded from trusted directories.
     """
     if path.endswith(".npz"):
@@ -1281,7 +1286,8 @@ def load_pkl_cartridge(path: str) -> dict:
 
 
 def load_npz_cartridge(path: str) -> dict:
-    """Load an .npz cartridge (safe — no code execution).
+    """Load an .npz cartridge. NOT safe on an untrusted file: allow_pickle=True below applies to
+    the whole archive, so any object array in it is unpickled (code execution).
 
     Supports split carts: if the index contains has_sqlite=True,
     texts are loaded as snippets from the index and full passages
@@ -1498,7 +1504,12 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str]):
-    """Save cartridge in safe NPZ format (no pickle, no code execution)."""
+    """Save a cartridge as NPZ.
+
+    This writes two object-dtype arrays (passages, compressed_texts). Numpy pickles object arrays,
+    so every reader of this file must pass allow_pickle=True. The NPZ format is therefore not
+    "no pickle" as written here. It used to claim "safe NPZ format (no pickle, no code execution)".
+    """
     compressed_texts = []
     for t in texts:
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
