@@ -1550,8 +1550,11 @@ async def rest_store(request: Request) -> JSONResponse:
     Step 3: per-user session_id from JWT so writes target the caller's own
     mounted state (not whatever the global slot happens to hold).
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         content = data.get("content", "")
@@ -1561,10 +1564,10 @@ async def rest_store(request: Request) -> JSONResponse:
         session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
         _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
         result = _call(content=content, tags=tags, session_id=session_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/store error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
@@ -2131,15 +2134,18 @@ async def rest_sync(request: Request) -> JSONResponse:
     Each exchange: { turn, userMessage, assistantMessage, timestamp, url, platform, platformName }
     Appends to cartridges/heartbeat_<machine>.jsonl (one JSON object per line).
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         exchanges = data.get("exchanges", [])
         machine = re.sub(r'[^a-zA-Z0-9_\-]', '_', data.get("machine", "unknown"))
 
         if not exchanges:
-            return JSONResponse({"status": "ok", "appended": 0}, headers=_cors_headers())
+            return JSONResponse({"status": "ok", "appended": 0}, headers=_write_cors_headers(request))
 
         # Ensure cartridges directory exists
         cart_dir = os.path.join(BASE_DIR, "cartridges")
@@ -2162,10 +2168,10 @@ async def rest_sync(request: Request) -> JSONResponse:
             "appended": appended,
             "file": f"heartbeat_{machine}.jsonl",
             "file_size": file_size,
-        }, headers=_cors_headers())
+        }, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/sync error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/cartridges", methods=["GET", "OPTIONS"])
@@ -2234,13 +2240,16 @@ async def rest_mount(request: Request) -> JSONResponse:
     - Anonymous callers fall through to the legacy behavior (default session,
       unscoped find_mempacks). Knowledge carts unaffected.
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         name = data.get("name", "")
         if not name:
-            return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
+            return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_write_cors_headers(request))
 
         # Identify caller via JWT (cookie or Bearer). None for anonymous.
         user_id = _get_user_id_from_request(request)
@@ -2261,10 +2270,10 @@ async def rest_mount(request: Request) -> JSONResponse:
 
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
         result = _call(name=name, session_id=session_id, owner_id=owner_id)
-        return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/passage", methods=["GET", "OPTIONS"])
@@ -2366,8 +2375,11 @@ async def rest_embed(request: Request) -> JSONResponse:
 @mcp.custom_route("/api/save", methods=["POST", "OPTIONS"])
 async def rest_save(request: Request) -> JSONResponse:
     """REST wrapper for save_cartridge — persist to disk."""
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json() if await request.body() else {}
         name = data.get("name", "")
@@ -2376,10 +2388,10 @@ async def rest_save(request: Request) -> JSONResponse:
         # save_cartridge(name="", session_id="") — pass the body through so a
         # REST caller can name a new cartridge (previously ignored). Mirrors rest_mount.
         result = _call(name=name, session_id=session_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 def _cors_headers():
@@ -2389,6 +2401,58 @@ def _cors_headers():
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
     }
+
+
+# Browser write gate (fleet port of Waving Cat's 2026-11-17 fix). Loopback is not a boundary
+# against a browser: a page on this machine can POST here. CORS `*` was never the hole -- a
+# cross-origin text/plain POST is a simple request (no preflight) and request.json() ignores
+# Content-Type, so the write lands whatever Allow-Origin says. Two checks, in this order, on every
+# unauthenticated write route: (1) an Origin that is present and not allow-listed -> 403;
+# (2) a body that is not application/json -> 415. The allow-list defaults to extension SCHEMES
+# (Heartbeat writes from an extension); MEMBOT_ALLOWED_ORIGINS (comma-separated exact origins)
+# replaces it. Not a defence against a hostile extension. Reads keep `*`.
+_EXTENSION_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return True  # CLI callers (curl, requests, SNARC) send no Origin
+    configured = os.environ.get("MEMBOT_ALLOWED_ORIGINS", "").strip()
+    if configured:
+        return origin in {o.strip() for o in configured.split(",") if o.strip()}
+    return origin.lower().startswith(_EXTENSION_SCHEMES)
+
+
+def _write_cors_headers(request) -> dict:
+    """CORS headers for a write route: echo an allowed Origin, omit Allow-Origin for a foreign one."""
+    origin = request.headers.get("origin", "")
+    h = {
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Vary": "Origin",
+    }
+    if not origin:
+        h["Access-Control-Allow-Origin"] = "*"
+    elif _origin_allowed(origin):
+        h["Access-Control-Allow-Origin"] = origin
+    return h
+
+
+async def _write_gate(request):
+    """Return a refusal response, or None when the write may proceed. Order matters (403 then 415)."""
+    origin = request.headers.get("origin", "")
+    if origin and not _origin_allowed(origin):
+        log.warning(f"REST write refused: foreign Origin {origin[:80]!r} on {request.url.path}")
+        return JSONResponse({"status": "error", "error": "Origin not allowed on a write route"},
+                            status_code=403, headers={"Vary": "Origin"})
+    if request.method == "OPTIONS":
+        return None
+    ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if ctype != "application/json" and (ctype or await request.body()):
+        # An empty body with no Content-Type (e.g. `curl -X POST /api/save`) carries nothing to type.
+        return JSONResponse({"status": "error", "error": "Content-Type must be application/json"},
+                            status_code=415, headers=_write_cors_headers(request))
+    return None
 
 
 # ============================================================
