@@ -85,6 +85,17 @@ out = probe(MEMBOT_OLLAMA_EMBED_NUM_GPU="0")
 check("explicit 0: options.num_gpu == 0",
       out["captured"][0]["body"].get("options", {}).get("num_gpu") == 0, out)
 
+# 4. keep_alive: absent by default (Ollama's own default applies), passed through when set.
+out = probe()
+check("default: no keep_alive sent", "keep_alive" not in out["captured"][0]["body"], out)
+out = probe(MEMBOT_OLLAMA_EMBED_KEEP_ALIVE="0")
+check("keep_alive 0: sent as \"0\" (unload right after the embed)",
+      out["captured"][0]["body"].get("keep_alive") == "0", out)
+out = probe(MEMBOT_OLLAMA_EMBED_KEEP_ALIVE="30s")
+check("keep_alive 30s: passed through", out["captured"][0]["body"].get("keep_alive") == "30s", out)
+check("keep_alive leaves num_gpu alone",
+      out["captured"][0]["body"].get("options", {}).get("num_gpu") == 0, out)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")

@@ -13,7 +13,9 @@ Architecture:
   - Compatible with Vector Plus Studio v8.3 cartridge format (.npz/.pkl)
 
 Security:
-  - New cartridges saved as NPZ (no code execution risk)
+  - New cartridges saved as NPZ. NOT a code-execution boundary: the NPZ reader opens archives
+    with np.load(allow_pickle=True), so an object array in a hostile .npz unpickles on load.
+    Load only carts you trust until the loader refuses object arrays (upstream gauntlet, gate 1).
   - Legacy .pkl loading restricted to trusted directories only
   - SHA256 manifest for cartridge integrity verification
   - Cartridge name sanitization (no path traversal)
@@ -112,20 +114,12 @@ MAX_ENTRIES = int(os.environ.get("MEMBOT_MAX_ENTRIES", 3_000_000))
 MAX_TEXT_LENGTH = int(os.environ.get("MEMBOT_MAX_TEXT_LENGTH", 10_000))
 MAX_QUERY_LENGTH = int(os.environ.get("MEMBOT_MAX_QUERY_LENGTH", 2_000))
 
-# CHUNK ON STORE. A long note stored as ONE passage is retrievable only as a whole: the
-# cartridge ranks it by a single embedding over everything it says, the search preview
-# shows its first ~550 characters, and get_passage returns the entire thing or nothing.
-# Both ends of that are wrong for a reader -- the ranking is blurred by every subject the
-# note is NOT being searched for, and the retrieval has no unit smaller than the note.
-#
-# cartridge_builder.chunk_text has always done this when a cartridge is BUILT (300 words,
-# 50 overlap). Nothing did it when one was WRITTEN, so an agent's own notes were the only
-# passages in its memory that could not be retrieved by section. Long stores now go
-# through the same splitter, and each piece ranks and reads on its own. Below the
-# threshold, one store is one passage, byte-identical to before.
-CHUNK_STORE_MIN_CHARS = int(os.getenv("MEMBOT_CHUNK_STORE_MIN_CHARS", "1200"))
-CHUNK_STORE_WORDS = int(os.getenv("MEMBOT_CHUNK_STORE_WORDS", "300"))
-CHUNK_STORE_OVERLAP = int(os.getenv("MEMBOT_CHUNK_STORE_OVERLAP", "50"))
+# Long local stores use the same passage splitter as cartridge ingestion, so recall can rank
+# and retrieve the relevant section rather than one embedding over an entire note. Mempacks
+# stay single-pattern until their remote persistence path has an atomic multi-pattern contract.
+CHUNK_STORE_MIN_CHARS = int(os.environ.get("MEMBOT_CHUNK_STORE_MIN_CHARS", 1200))
+CHUNK_STORE_WORDS = int(os.environ.get("MEMBOT_CHUNK_STORE_WORDS", 300))
+CHUNK_STORE_OVERLAP = int(os.environ.get("MEMBOT_CHUNK_STORE_OVERLAP", 50))
 SAFE_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_\- \.]*$')
 
 
@@ -465,14 +459,25 @@ def _ollama_available() -> bool:
 # a layer count on a host where the accelerator is genuinely free.
 _ollama_embed_num_gpu = int(os.getenv("MEMBOT_OLLAMA_EMBED_NUM_GPU", "0"))
 
+# HOW LONG THE EMBEDDER STAYS LOADED AFTER A SEARCH, per host (dp 2026-10-12, Sprout). Ollama keeps a
+# model 5 minutes after each request by default. On Sprout (7.4 GB unified memory, the being's 4B at
+# 3.3 GB) nomic-embed-text is 359 MB that stays resident beside the being after every recall, taking
+# room the being's thinking could use, though searches are intermittent. MEMBOT_OLLAMA_EMBED_KEEP_ALIVE
+# is passed through as Ollama's `keep_alive` ("0" unloads right after the embed; "30s", "5m", ...).
+# Unset: the field is not sent and Ollama's default applies, so nothing changes for other hosts.
+_ollama_embed_keep_alive = (os.getenv("MEMBOT_OLLAMA_EMBED_KEEP_ALIVE") or "").strip() or None
+
 
 def _embed_via_ollama(text: str) -> np.ndarray:
     """Get embedding from Ollama API (no extra RAM -- reuses running Ollama process).
 
-    Embeds on the CPU by default: see _ollama_embed_num_gpu above."""
+    Embeds on the CPU by default: see _ollama_embed_num_gpu above. Stays loaded as long as
+    _ollama_embed_keep_alive says (Ollama's default when unset)."""
     import urllib.request
-    payload = json.dumps({"model": _ollama_embed_model, "input": text,
-                          "options": {"num_gpu": _ollama_embed_num_gpu}}).encode()
+    body = {"model": _ollama_embed_model, "input": text, "options": {"num_gpu": _ollama_embed_num_gpu}}
+    if _ollama_embed_keep_alive is not None:
+        body["keep_alive"] = _ollama_embed_keep_alive
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{_ollama_url}/api/embed",
         data=payload,
@@ -1216,9 +1221,12 @@ def find_cartridges() -> list[dict]:
 
 
 def load_cartridge_safe(path: str) -> dict:
-    """Load a cartridge using the safest available method.
+    """Load a cartridge by extension.
 
-    NPZ files are always safe (no code execution).
+    NPZ files are NOT checked against the trusted directories, and they are NOT safe: the NPZ
+    reader passes allow_pickle=True, so an object array in the archive unpickles (code execution).
+    This docstring used to say "NPZ files are always safe (no code execution)". That claim is why
+    .pkl got a trusted-directory gate and .npz did not (Waving Cat, 2026-11-09).
     PKL files are only loaded from trusted directories.
     """
     if path.endswith(".npz"):
@@ -1278,7 +1286,8 @@ def load_pkl_cartridge(path: str) -> dict:
 
 
 def load_npz_cartridge(path: str) -> dict:
-    """Load an .npz cartridge (safe — no code execution).
+    """Load an .npz cartridge. NOT safe on an untrusted file: allow_pickle=True below applies to
+    the whole archive, so any object array in it is unpickled (code execution).
 
     Supports split carts: if the index contains has_sqlite=True,
     texts are loaded as snippets from the index and full passages
@@ -1495,7 +1504,12 @@ def _unpack_hippocampus(raw: np.ndarray) -> list[dict]:
 
 
 def save_as_npz(path: str, embeddings: np.ndarray, texts: list[str]):
-    """Save cartridge in safe NPZ format (no pickle, no code execution)."""
+    """Save a cartridge as NPZ.
+
+    This writes two object-dtype arrays (passages, compressed_texts). Numpy pickles object arrays,
+    so every reader of this file must pass allow_pickle=True. The NPZ format is therefore not
+    "no pickle" as written here. It used to claim "safe NPZ format (no pickle, no code execution)".
+    """
     compressed_texts = []
     for t in texts:
         compressed_texts.append(np.void(zlib.compress(t.encode("utf-8"), level=9)))
@@ -1547,8 +1561,11 @@ async def rest_store(request: Request) -> JSONResponse:
     Step 3: per-user session_id from JWT so writes target the caller's own
     mounted state (not whatever the global slot happens to hold).
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         content = data.get("content", "")
@@ -1558,10 +1575,10 @@ async def rest_store(request: Request) -> JSONResponse:
         session_id = _session_id_for_user(user_id, fallback=data.get("session_id", ""))
         _call = getattr(memory_store, 'fn', memory_store)  # FastMCP 2.x vs 3.x
         result = _call(content=content, tags=tags, session_id=session_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/store error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/search", methods=["POST", "OPTIONS"])
@@ -2128,15 +2145,18 @@ async def rest_sync(request: Request) -> JSONResponse:
     Each exchange: { turn, userMessage, assistantMessage, timestamp, url, platform, platformName }
     Appends to cartridges/heartbeat_<machine>.jsonl (one JSON object per line).
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         exchanges = data.get("exchanges", [])
         machine = re.sub(r'[^a-zA-Z0-9_\-]', '_', data.get("machine", "unknown"))
 
         if not exchanges:
-            return JSONResponse({"status": "ok", "appended": 0}, headers=_cors_headers())
+            return JSONResponse({"status": "ok", "appended": 0}, headers=_write_cors_headers(request))
 
         # Ensure cartridges directory exists
         cart_dir = os.path.join(BASE_DIR, "cartridges")
@@ -2159,10 +2179,10 @@ async def rest_sync(request: Request) -> JSONResponse:
             "appended": appended,
             "file": f"heartbeat_{machine}.jsonl",
             "file_size": file_size,
-        }, headers=_cors_headers())
+        }, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/sync error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/cartridges", methods=["GET", "OPTIONS"])
@@ -2231,13 +2251,16 @@ async def rest_mount(request: Request) -> JSONResponse:
     - Anonymous callers fall through to the legacy behavior (default session,
       unscoped find_mempacks). Knowledge carts unaffected.
     """
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json()
         name = data.get("name", "")
         if not name:
-            return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_cors_headers())
+            return JSONResponse({"status": "error", "error": "name required"}, status_code=400, headers=_write_cors_headers(request))
 
         # Identify caller via JWT (cookie or Bearer). None for anonymous.
         user_id = _get_user_id_from_request(request)
@@ -2258,10 +2281,10 @@ async def rest_mount(request: Request) -> JSONResponse:
 
         _call = getattr(mount_cartridge, 'fn', mount_cartridge)
         result = _call(name=name, session_id=session_id, owner_id=owner_id)
-        return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result, "created": created}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/mount error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 @mcp.custom_route("/api/passage", methods=["GET", "OPTIONS"])
@@ -2363,8 +2386,11 @@ async def rest_embed(request: Request) -> JSONResponse:
 @mcp.custom_route("/api/save", methods=["POST", "OPTIONS"])
 async def rest_save(request: Request) -> JSONResponse:
     """REST wrapper for save_cartridge — persist to disk."""
+    _deny = await _write_gate(request)
+    if _deny is not None:
+        return _deny
     if request.method == "OPTIONS":
-        return JSONResponse({}, headers=_cors_headers())
+        return JSONResponse({}, headers=_write_cors_headers(request))
     try:
         data = await request.json() if await request.body() else {}
         name = data.get("name", "")
@@ -2373,10 +2399,10 @@ async def rest_save(request: Request) -> JSONResponse:
         # save_cartridge(name="", session_id="") — pass the body through so a
         # REST caller can name a new cartridge (previously ignored). Mirrors rest_mount.
         result = _call(name=name, session_id=session_id)
-        return JSONResponse({"status": "ok", "result": result}, headers=_cors_headers())
+        return JSONResponse({"status": "ok", "result": result}, headers=_write_cors_headers(request))
     except Exception as e:
         log.error(f"REST /api/save error: {e}")
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_cors_headers())
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500, headers=_write_cors_headers(request))
 
 
 def _cors_headers():
@@ -2386,6 +2412,58 @@ def _cors_headers():
         "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
     }
+
+
+# Browser write gate (fleet port of Waving Cat's 2026-11-17 fix). Loopback is not a boundary
+# against a browser: a page on this machine can POST here. CORS `*` was never the hole -- a
+# cross-origin text/plain POST is a simple request (no preflight) and request.json() ignores
+# Content-Type, so the write lands whatever Allow-Origin says. Two checks, in this order, on every
+# unauthenticated write route: (1) an Origin that is present and not allow-listed -> 403;
+# (2) a body that is not application/json -> 415. The allow-list defaults to extension SCHEMES
+# (Heartbeat writes from an extension); MEMBOT_ALLOWED_ORIGINS (comma-separated exact origins)
+# replaces it. Not a defence against a hostile extension. Reads keep `*`.
+_EXTENSION_SCHEMES = ("chrome-extension://", "moz-extension://", "safari-web-extension://")
+
+
+def _origin_allowed(origin: str) -> bool:
+    if not origin:
+        return True  # CLI callers (curl, requests, SNARC) send no Origin
+    configured = os.environ.get("MEMBOT_ALLOWED_ORIGINS", "").strip()
+    if configured:
+        return origin in {o.strip() for o in configured.split(",") if o.strip()}
+    return origin.lower().startswith(_EXTENSION_SCHEMES)
+
+
+def _write_cors_headers(request) -> dict:
+    """CORS headers for a write route: echo an allowed Origin, omit Allow-Origin for a foreign one."""
+    origin = request.headers.get("origin", "")
+    h = {
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Vary": "Origin",
+    }
+    if not origin:
+        h["Access-Control-Allow-Origin"] = "*"
+    elif _origin_allowed(origin):
+        h["Access-Control-Allow-Origin"] = origin
+    return h
+
+
+async def _write_gate(request):
+    """Return a refusal response, or None when the write may proceed. Order matters (403 then 415)."""
+    origin = request.headers.get("origin", "")
+    if origin and not _origin_allowed(origin):
+        log.warning(f"REST write refused: foreign Origin {origin[:80]!r} on {request.url.path}")
+        return JSONResponse({"status": "error", "error": "Origin not allowed on a write route"},
+                            status_code=403, headers={"Vary": "Origin"})
+    if request.method == "OPTIONS":
+        return None
+    ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if ctype != "application/json" and (ctype or await request.body()):
+        # An empty body with no Content-Type (e.g. `curl -X POST /api/save`) carries nothing to type.
+        return JSONResponse({"status": "error", "error": "Content-Type must be application/json"},
+                            status_code=415, headers=_write_cors_headers(request))
+    return None
 
 
 # ============================================================
@@ -5225,6 +5303,7 @@ def walk_associate_core(
     walk_max_show: int = 10,
     temperature: float = 0.0,
     session_id: str = "",
+    cart_id: str = "",
 ) -> dict:
     """Library-level walk_associate entry point. Returns a structured dict.
 
@@ -5243,7 +5322,19 @@ def walk_associate_core(
         walk_max_show: Maximum "missed" items to surface (default 10)
         temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise
             to walk-hop queries for basin escape
-        session_id: Session identifier (uses default session if empty)
+        session_id: Session identifier (uses default session if empty).
+            Ignored when cart_id is given.
+        cart_id: Walk a cart mounted through `multi_cart` instead of the
+            caller's session. ⭐ HUB's seam, asked 2026-06-17 and answered
+            2026-10-24: the sidecar mounts via `multi_cart.mount(path)`, which
+            `mount_cartridge` cannot do because it resolves a registry NAME
+            against membot's depot rather than an arbitrary `.cart.npz` path.
+            Without this, a cart the sidecar mounted was unreachable from walk.
+            Empty (default) = today's behaviour exactly.
+            ⚠ LIBRARY-ONLY. The `multi_cart` pool has no owner, so this
+            selector trusts its caller to be the process that mounted the cart.
+            It is NOT exposed on the `walk_associate` MCP tool, and must not be
+            without per-caller mount ownership (NOVA's HOLD on #9).
 
     Returns:
         dict with the following shape:
@@ -5297,14 +5388,54 @@ def walk_associate_core(
         result["error"] = f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
         return result
 
-    session_id = _resolve_session_id(session_id)
-    state = _get_session(session_id)
-    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
+    # ──────────────────────────────────────────────────────────────────────
+    # STATE RESOLUTION — a session, or a multi_cart mount. ONE place.
+    #
+    # ⭐ `_new_cart_state()` in multi_cart carries the comment "Same shape as
+    #   _new_session in membot_server". The two were built to match and never
+    #   joined; this is the join. Of the ten keys walk touches, eight are
+    #   identical across both. Only two differ, and only one needs mapping:
+    #     cartridge_name -> cart_name   (3 reads: the guard, result, the header)
+    #     query_count                   (a WRITE, already .get()-defensive)
+    #
+    # ⚠ `owns_state` exists because a multi_cart entry is a SHARED module-global
+    #   (`_mounted_carts[cart_id]`), not this caller's private session dict, and
+    #   up to `_default_search_slots()` walks can run concurrently. A read path
+    #   must not mutate a shared payload, so the per-session query counter is
+    #   skipped for pooled carts rather than racing on someone else's dict.
+    # ──────────────────────────────────────────────────────────────────────
+    if cart_id:
+        # Local import: `import multi_cart as _mc` sits at module scope but far
+        # BELOW this function, so referencing it here would read as a forward
+        # reference even though load order makes it work. multi_cart imports
+        # nothing from this module (the shared helpers moved to cart_io.py on
+        # 2026-08-01 precisely to break that cycle), so this is cheap and safe.
+        import multi_cart as _mc_local
+        state = _mc_local.get_cart(cart_id)
+        if state is None:
+            # Name NO other mount: listing the pool would disclose cart ids other
+            # callers mounted (NOVA's HOLD on #9). The in-process caller that
+            # wants the list has `multi_cart.list_mounts()` itself.
+            result["error"] = (
+                f"cart_id '{cart_id}' is not mounted. "
+                "Use multi_cart.mount() first, or omit cart_id to walk the session.")
+            return result
+        cart_label = state.get("cart_name") or cart_id
+        owns_state = False
+        # cart_id, not the query: the query text of a pooled-cart walk stays out of logs.
+        log.info(f"walk_associate(top_k={top_k}, temp={temperature:.2f}, cart_id={cart_id})")
+    else:
+        session_id = _resolve_session_id(session_id)
+        state = _get_session(session_id)
+        owns_state = True
+        log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
 
-    if state["cartridge_name"] is None:
-        result["error"] = "No cartridge mounted. Use mount_cartridge first."
-        return result
-    result["cart"] = state["cartridge_name"]
+        if state["cartridge_name"] is None:
+            result["error"] = "No cartridge mounted. Use mount_cartridge first."
+            return result
+        cart_label = state["cartridge_name"]
+
+    result["cart"] = cart_label
 
     has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
     if not has_embeddings:
@@ -5423,15 +5554,24 @@ def walk_associate_core(
                 "next": r["next"],
             })
 
-        state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id, "walk",
-                      f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
-                      elapsed_ms)
+        # Only a session owns a query counter. A pooled multi_cart entry is shared
+        # across callers and threads; incrementing it here would be a read path
+        # writing someone else's dict. See the resolution block above.
+        if owns_state:
+            state["query_count"] = state.get("query_count", 0) + 1
+        if owns_state:
+            _log_activity(session_id, "walk",
+                          f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
+                          elapsed_ms)
+        else:
+            _log_activity(f"cart:{cart_id}", "walk",
+                          f"cart_id={cart_id} -> primary={len(result['primary'])} missed={len(result['missed'])}",
+                          elapsed_ms)
 
         result["elapsed_ms"] = elapsed_ms
         result["header"] = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
                             f"{len(result['primary'])} primary + {len(result['missed'])} missed from "
-                            f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)")
+                            f"'{cart_label}' ({elapsed_ms:.0f}ms)")
 
     except Exception as e:
         log.error(f"Walk error: {e}")
@@ -5532,6 +5672,11 @@ def walk_associate(
     library) should call `walk_associate_core(...)` directly and get the typed
     dict result. This @mcp.tool() wrapper exists for MCP/LLM hosts that need
     the documented text format.
+
+    ⚠ No `cart_id` here, deliberately (NOVA's HOLD on #9). `multi_cart` mounts
+    live in a process-global pool with no owner, so a network caller naming a
+    cart_id would read a cart some other client mounted. The selector is on
+    `walk_associate_core` only, for the in-process caller that mounted the cart.
     """
     result = walk_associate_core(
         query=query,
@@ -5687,42 +5832,34 @@ def mempack_update_pattern_i(text: str, session_id: str = "") -> str:
 
 
 def _chunk_for_store(content: str) -> list[str]:
-    """Split one store into the passages it will be retrieved as.
+    """Return the local passages one memory_store call should create.
 
-    Short content passes through whole -- one store, one passage, unchanged. Long content
-    is split by cartridge_builder.chunk_text, the same splitter cartridges are BUILT with,
-    so a written passage and an ingested one have the same shape. A caller that knows its
-    own boundaries can place ---PASSAGE_BREAK--- sentinels and chunk_text will honour them
-    instead of counting words.
-
-    Never raises. If the splitter cannot be imported or throws, the content is stored
-    whole, which is exactly what happened before this function existed.
+    Short input is byte-preserving. Long input uses the canonical cartridge builder splitter,
+    including explicit ---PASSAGE_BREAK--- boundaries. Failure is conservative: store the input
+    as one passage rather than lose it.
     """
-    text = content.strip()
-    if len(text) <= CHUNK_STORE_MIN_CHARS and "---PASSAGE_BREAK---" not in text:
-        return [text]
+    if len(content) <= CHUNK_STORE_MIN_CHARS and "---PASSAGE_BREAK---" not in content:
+        return [content]
     try:
         from cartridge_builder import chunk_text
-        chunks = [c.strip() for c in chunk_text(text, CHUNK_STORE_WORDS, CHUNK_STORE_OVERLAP)]
+        chunks = chunk_text(content, CHUNK_STORE_WORDS, CHUNK_STORE_OVERLAP)
+        chunks = [chunk for chunk in chunks if chunk]
+        return chunks or [content]
     except Exception as e:
         log.warning(f"chunk-on-store unavailable ({e}); storing whole")
-        return [text]
-    return [c for c in chunks if c] or [text]
+        return [content]
 
 
 @mcp.tool()
 def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     """Store new text in the currently mounted cartridge.
-    The text is embedded via Nomic and added to the searchable memory.
-    If GPU is available, the pattern is also imprinted into the lattice.
 
-    Content longer than ~1,200 characters is split into overlapping passages (300 words,
-    50 overlap) so it can be recalled by section rather than only as a whole; each piece
-    is labelled "(part i/n)" and they occupy consecutive indices. Put ---PASSAGE_BREAK---
-    where you want the splits if the word count is the wrong boundary.
+    Local cartridges split long content into overlapping passages using the same splitter as
+    cartridge ingestion. Mempacks remain one remote pattern per call until their persistence
+    surface has an atomic multi-pattern contract.
 
     Args:
-        content: Text content to memorize (max 10,000 chars)
+        content: Text content to memorize
         tags: Optional metadata tags (prepended to stored text)
         session_id: Session identifier (uses default session if empty)
     """
@@ -5735,120 +5872,96 @@ def memory_store(content: str, tags: str = "", session_id: str = "") -> str:
     if state["cartridge_name"] is None:
         return "No cartridge mounted. Use mount_cartridge first."
 
-    # Read-only carve-out for Mempacks. The --read-only flag is about
-    # server-managed knowledge carts on droplet FS; Mempacks live in
-    # Supabase under the user's own row + bucket folder. Per-user writes
-    # to Mempacks should work even on the public read-only port.
     is_mempack = bool(state.get("mempack_id"))
     if _server_config.get("read_only") and not is_mempack:
         return "Server is in read-only mode. memory_store is disabled for non-Mempack carts."
 
-    n_current = len(state["texts"]) if state["texts"] else 0
-    if n_current >= MAX_ENTRIES:
-        return f"Cartridge full ({n_current}/{MAX_ENTRIES}). Save and start a new cartridge."
-
-    pieces = _chunk_for_store(content)
+    pieces = [content] if is_mempack else _chunk_for_store(content)
     n_pieces = len(pieces)
-    # ROOM FOR THE WHOLE ENTRY OR NONE OF IT. A chunked store that ran out of room
-    # half-way would leave "(part 3/7)" as the end of a memory, and nothing would say so.
+    n_current = len(state["texts"]) if state["texts"] else 0
+
     if n_current + n_pieces > MAX_ENTRIES:
-        return (f"Cartridge full ({n_current}/{MAX_ENTRIES}); this entry needs {n_pieces} "
-                f"more. Save and start a new cartridge.")
+        return (
+            f"Cartridge full ({n_current}/{MAX_ENTRIES}); this entry needs {n_pieces} "
+            "passage(s). Save and start a new cartridge."
+        )
 
-    def _passage(i: int) -> str:
+    def passage(i: int) -> str:
         part = f"(part {i + 1}/{n_pieces}) " if n_pieces > 1 else ""
-        return f"[{tags}] {part}{pieces[i]}" if tags else f"{part}{pieces[i]}"
+        body = f"{part}{pieces[i]}"
+        return f"[{tags}] {body}" if tags else body
 
-    # Exact-dedup: refuse byte-identical re-stores. Clients (e.g. snarc's bridge)
-    # re-emit recurring patterns every session; storing the same entry twice only
-    # bloats the cartridge and pollutes recall. No-op skip, not an error.
-    # Per PIECE, not per call. That is weaker than it sounds and the limit is worth
-    # stating: the label carries the TOTAL, so appending a paragraph to a note can change
-    # n_pieces, change every label, and re-store the whole thing. What it does buy is a
-    # re-store of the IDENTICAL note skipping silently, which is the case that actually
-    # recurs, and a piece-level skip whenever the split lands the same way.
-    existing = set(state["texts"]) if state["texts"] else set()
-    fresh = [(i, _passage(i)) for i in range(n_pieces)]
-    n_dupes = sum(1 for _, t in fresh if t in existing)
-    fresh = [(i, t) for i, t in fresh if t not in existing]
-    if not fresh:
-        return f"Duplicate — already stored, skipped: \"{content[:60]}\""
+    stored = [passage(i) for i in range(n_pieces)]
+    present = [text in state["texts"] for text in stored] if state["texts"] else [False] * n_pieces
+    if all(present):
+        return f'Duplicate — already stored, skipped: "{content[:60]}"'
+    if any(present):
+        return (
+            "Partial duplicate — nothing stored: some passages from this exact split are already "
+            "present. Inspect or supersede the existing memory before retrying."
+        )
 
-    log.info(f"memory_store('{content[:60]}...', is_mempack={is_mempack}, "
-             f"pieces={n_pieces}, new={len(fresh)})")
+    log.info(
+        f"memory_store('{content[:60]}...', is_mempack={is_mempack}, passages={n_pieces})"
+    )
 
     try:
         t0 = time.time()
-        idxs = []
+
+        # Prepare every embedding before mutating session state. A failed embedding therefore
+        # cannot leave half of a chunked memory in the cartridge.
+        embeddings = [embed_text(piece, prefix="search_document") for piece in pieces]
+        binary_rows = [(emb > 0).astype(np.uint8).reshape(1, -1) for emb in embeddings]
+
+        new_embeddings = np.vstack([emb.reshape(1, -1) for emb in embeddings])
+        new_binary = np.vstack(binary_rows)
+        if state["embeddings"] is None or len(state["embeddings"]) == 0:
+            state["embeddings"] = new_embeddings
+        else:
+            state["embeddings"] = np.vstack([state["embeddings"], new_embeddings])
+        if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
+            state["binary_corpus"] = new_binary
+        else:
+            state["binary_corpus"] = np.vstack([state["binary_corpus"], new_binary])
+
+        state["texts"].extend(stored)
+        state["modified"] = True
+        state["has_embeddings"] = True
+
         gpu_msg = ""
-        persist_msg = ""
-
-        for i, stored_text in fresh:
-            # 1. Embed via Nomic. The PIECE, not its label: a "(part 2/5)" prefix in the
-            # vector would move every chunked passage toward every other one.
-            emb = embed_text(pieces[i], prefix="search_document")
-
-            # 2. Add to embedding matrix
-            if state["embeddings"] is None or len(state["embeddings"]) == 0:
-                state["embeddings"] = emb.reshape(1, -1)
-            else:
-                state["embeddings"] = np.vstack([state["embeddings"], emb.reshape(1, -1)])
-
-            # 3. Extend binary corpus (sign_zero for Hamming search)
-            new_bin = (emb > 0).astype(np.uint8).reshape(1, -1)
-            if state["binary_corpus"] is None or len(state["binary_corpus"]) == 0:
-                state["binary_corpus"] = new_bin
-            else:
-                state["binary_corpus"] = np.vstack([state["binary_corpus"], new_bin])
-
-            # 4. Store text
-            state["texts"].append(stored_text)
-            state["modified"] = True
-            idxs.append(len(state["texts"]) - 1)
-            # A STORE IS WHAT MAKES AN EMPTY CARTRIDGE SEARCHABLE BY MEANING, and only
-            # mount_cartridge set this flag. A session that mounted an EMPTY cart got
-            # has_embeddings=False and kept it for the life of the session, so every
-            # search ran hamming-only over vectors that were right there -- the shape a
-            # new being on a fresh cartridge lives in for its whole first session.
-            state["has_embeddings"] = True
-
-            # 5. GPU lattice imprint (if available)
-            if _gpu_state["available"] and _gpu_state["lattice"] is not None:
-                try:
-                    ml = _gpu_state["lattice"]
+        if _gpu_state["available"] and _gpu_state["lattice"] is not None:
+            try:
+                ml = _gpu_state["lattice"]
+                for emb in embeddings:
                     ml.reset()
                     ml.imprint_vector(emb)
                     ml.settle(frames=10, learn=True)
-                    gpu_msg = " + lattice imprint"
-                except Exception as e:
-                    gpu_msg = f" (lattice failed: {e})"
-                    log.warning(f"Lattice imprint failed: {e}")
+                gpu_msg = " + lattice imprint"
+            except Exception as e:
+                gpu_msg = f" (lattice failed: {e})"
+                log.warning(f"Lattice imprint failed: {e}")
 
-            # 6. Mempack persistence: if this is a Supabase-backed Mempack, round-trip
-            # the new pattern back to Storage + mempack_patterns. Last-writer-wins
-            # for v1; concurrent writes from two agents to the same Mempack are
-            # rare enough to defer optimistic-locking to v1.2.
-            if state.get("mempack_id") and _supabase_available():
-                try:
-                    persist_msg = " + " + _mempack_persist_new_pattern(state, stored_text, emb)
-                except Exception as e:
-                    persist_msg = f" (Mempack persistence FAILED: {e})"
-                    log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
+        persist_msg = ""
+        if state.get("mempack_id") and _supabase_available():
+            try:
+                # Mempacks are deliberately single-passage above, preserving today's remote
+                # one-call/one-pattern persistence contract.
+                persist_msg = " + " + _mempack_persist_new_pattern(
+                    state, stored[0], embeddings[0]
+                )
+            except Exception as e:
+                persist_msg = f" (Mempack persistence FAILED: {e})"
+                log.error(f"Mempack persistence failed for {state.get('mempack_id')}: {e}")
 
         elapsed_ms = (time.time() - t0) * 1000
         n = len(state["texts"])
-        skipped = f", {n_dupes} already stored" if n_dupes else ""
-        # SAY THE HANDLE THE READER WILL ACTUALLY USE (main #5): `#{n}` is 1-based and stays
-        # as it was, because journals cite it; the handle get_passage takes is printed in
-        # search's own vocabulary, `idx:N`. With chunk-on-store (#4) one store may be several
-        # passages at consecutive indices, so a multi-part store names the whole span.
-        if len(idxs) == 1 and n_pieces == 1:
-            where = f"#{n} (idx:{idxs[0]})"
-        else:
-            plural = "" if len(idxs) == 1 else "s"
-            where = (f"#{n - len(idxs) + 1}-#{n} in {len(idxs)} part{plural} "
-                     f"(idx:{idxs[0]}-{idxs[-1]}{skipped})")
-        return f"Stored memory {where}{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
+        first = n_current if n > n_current else max(0, n - 1)
+        handle = f"idx:{first}" if n - first <= 1 else f"idx:{first}-{n - 1}"
+        parts = f", {n_pieces} passages" if n_pieces > 1 else ""
+        return (
+            f"Stored memory #{n} ({handle}{parts})"
+            f"{gpu_msg}{persist_msg} ({elapsed_ms:.0f}ms)"
+        )
 
     except Exception as e:
         log.error(f"Store error: {e}")
@@ -6799,340 +6912,6 @@ def get_pattern_meta(cartridge: str, idx: int, session_id: str = "") -> str:
     )
 
     return _json.dumps(record, ensure_ascii=False)
-
-
-# ============================================================
-# walk_associate  --  substrate-walk MCP tool
-# (synced from project-you-apps/membot upstream 2026-06-10, refactored
-#  into core + MCP wrapper per HUB-Claude's localhost-sidecar request)
-# ============================================================
-
-def walk_associate_core(
-    query: str,
-    top_k: int = 10,
-    walk_top_k: int = 0,
-    walk_min_hits: int = 2,
-    walk_max_show: int = 10,
-    temperature: float = 0.0,
-    session_id: str = "",
-) -> dict:
-    """Library-level walk_associate entry point. Returns a structured dict.
-
-    This is the function in-process consumers (e.g. the Web4 hub's membox
-    sidecar) should import and call directly. The @mcp.tool() wrapper at
-    `walk_associate(...)` simply calls this function and formats the result
-    into the documented MCP text response for LLM hosts.
-
-    Args (identical to the @mcp.tool() wrapper):
-        query: The seed query / concept to walk from
-        top_k: Primary results returned to the caller (default 10)
-        walk_top_k: Per-primary walk-hop neighbor count
-            (default 0 = auto = max(top_k*3, 20))
-        walk_min_hits: Minimum walk-counts to promote an item to "missed"
-            (default 2)
-        walk_max_show: Maximum "missed" items to surface (default 10)
-        temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise
-            to walk-hop queries for basin escape
-        session_id: Session identifier (uses default session if empty)
-
-    Returns:
-        dict with the following shape:
-            {
-                "cart":        str | None,   # mounted cartridge name
-                "query":       str,
-                "temperature": float,
-                "elapsed_ms":  float,
-                "header":      str,          # human-readable summary line
-                                              # (first line of MCP text output)
-                "primary":     list[dict],   # direct semantic matches
-                "missed":      list[dict],   # walk-discovered consensus hits
-                "error":       str | None,   # set on failure; primary+missed
-                                              # are empty lists when error is set
-            }
-
-        Each item in "primary" has keys:
-            idx:   int           - passage index in the cart
-            score: float         - cosine similarity to the query
-            text:  str           - passage text (truncated to 500 chars)
-            prev:  int | None    - hippocampus nav link, prev passage idx
-            next:  int | None    - hippocampus nav link, next passage idx
-
-        Each item in "missed" has keys:
-            idx:   int
-            hits:  int           - how many primary results walked to this neighbor
-            avg:   float         - average cosine similarity across walk hops
-            text:  str
-            prev:  int | None
-            next:  int | None
-
-    Integration callers (Web4 hub-style) typically iterate primary + missed,
-    map `idx` -> their domain identifier (e.g. member LCT) via their own
-    sidecar metadata, then re-emit as `{agent_id, score, text, ...}` for their
-    own downstream consumers. This function intentionally only knows about
-    passage indices; the idx -> identifier mapping is the caller's
-    responsibility because only the caller knows what each passage represents.
-    """
-    result: dict = {
-        "cart": None,
-        "query": query,
-        "temperature": float(temperature),
-        "elapsed_ms": 0.0,
-        "header": "",
-        "primary": [],
-        "missed": [],
-        "error": None,
-    }
-
-    if len(query) > MAX_QUERY_LENGTH:
-        result["error"] = f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LENGTH}."
-        return result
-
-    session_id = _resolve_session_id(session_id)
-    state = _get_session(session_id)
-    log.info(f"walk_associate('{query[:60]}', top_k={top_k}, temp={temperature:.2f}, session={session_id})")
-
-    if state["cartridge_name"] is None:
-        result["error"] = "No cartridge mounted. Use mount_cartridge first."
-        return result
-    result["cart"] = state["cartridge_name"]
-
-    has_embeddings = state.get("has_embeddings", True) and state["embeddings"] is not None and len(state["embeddings"]) > 0
-    if not has_embeddings:
-        result["error"] = ("walk_associate requires full embeddings to re-query from items. "
-                           "This cart appears to be sign-bit-only; use memory_search instead.")
-        return result
-
-    try:
-        t0 = time.time()
-
-        # 1. Embed query
-        query_emb = embed_text(query, prefix="search_query")
-
-        # Normalize the corpus for cosine
-        stored = state["embeddings"]
-        stored_norms = np.linalg.norm(stored, axis=1, keepdims=True) + 1e-9
-        stored_n = stored / stored_norms
-
-        # 2. Primary top-K via cosine
-        q_norm = query_emb / (np.linalg.norm(query_emb) + 1e-9)
-        primary_scores = stored_n @ q_norm
-        primary_idx = np.argpartition(-primary_scores, min(top_k, len(primary_scores) - 1))[:top_k]
-        primary_idx = primary_idx[np.argsort(-primary_scores[primary_idx])]
-        primary = [(int(i), float(primary_scores[i])) for i in primary_idx]
-        primary_ids = {idx for idx, _ in primary}
-
-        # 3. Walk hop: for each primary item, re-query corpus with its embedding
-        # (optionally perturbed by temperature for basin escape).
-        effective_walk_k = walk_top_k if walk_top_k > 0 else max(top_k * 3, 20)
-        effective_walk_k = min(effective_walk_k, len(stored_n) - 1)
-
-        from collections import defaultdict
-        walk_counts: dict[int, int] = defaultdict(int)
-        walk_score_sum: dict[int, float] = defaultdict(float)
-
-        rng = np.random.default_rng() if temperature > 0 else None
-        noise_std = temperature * 0.1  # calibration: temp=0.5 -> noise_std=0.05
-
-        for idx, _ in primary:
-            item_vec = stored_n[idx]
-            if rng is not None and noise_std > 0:
-                perturbed = item_vec + rng.standard_normal(item_vec.shape).astype(np.float32) * noise_std
-                walk_vec = perturbed / (np.linalg.norm(perturbed) + 1e-9)
-            else:
-                walk_vec = item_vec
-            neighbor_scores = stored_n @ walk_vec
-            neighbor_scores[idx] = -np.inf  # exclude self
-            nbr_top = np.argpartition(-neighbor_scores, effective_walk_k)[:effective_walk_k]
-            for nidx in nbr_top:
-                walk_counts[int(nidx)] += 1
-                walk_score_sum[int(nidx)] += float(neighbor_scores[nidx])
-
-        # 4. "May have missed" = items walked-to >= walk_min_hits times AND not in primary
-        missed_tuples = []
-        for idx, cnt in walk_counts.items():
-            if idx in primary_ids:
-                continue
-            if cnt < walk_min_hits:
-                continue
-            avg_score = walk_score_sum[idx] / cnt
-            missed_tuples.append((idx, cnt, avg_score))
-        missed_tuples.sort(key=lambda x: (-x[1], -x[2]))
-        missed_tuples = missed_tuples[:walk_max_show]
-
-        elapsed_ms = (time.time() - t0) * 1000
-
-        # 5. Resolve full passage text + hippocampus nav for each result idx
-        all_indices = [i for i, _ in primary] + [i for i, _, _ in missed_tuples]
-        full_texts = {}
-        if state.get("is_split_cart") and state.get("sqlite_conn"):
-            full_texts = _sqlite_fetch_passages(state["sqlite_conn"], all_indices)
-
-        hippo = state.get("hippocampus")
-
-        def _resolve(i: int) -> dict:
-            """Return {text, prev, next} for passage idx i."""
-            if i in full_texts:
-                text = full_texts[i]["passage"]
-            else:
-                text = state["texts"][i]
-            if len(text) > 500:
-                text = text[:500] + "..."
-            prev_idx, next_idx = None, None
-            if hippo and i < len(hippo):
-                h = hippo[i]
-                if h.get("prev"):
-                    prev_idx = int(h["prev"]) - 1
-                if h.get("next"):
-                    next_idx = int(h["next"]) - 1
-            return {"text": text, "prev": prev_idx, "next": next_idx}
-
-        # Build structured primary list. Core does NOT filter on score --
-        # in-process consumers (e.g. the Web4 hub sidecar) want every result
-        # with its score so they can apply their own threshold. The MCP text
-        # formatter applies a score < 0.1 display filter to keep LLM output
-        # readable.
-        for i, score in primary:
-            r = _resolve(i)
-            result["primary"].append({
-                "idx": i,
-                "score": score,
-                "text": r["text"],
-                "prev": r["prev"],
-                "next": r["next"],
-            })
-
-        # Build structured missed list
-        for i, cnt, avg_score in missed_tuples:
-            r = _resolve(i)
-            result["missed"].append({
-                "idx": i,
-                "hits": cnt,
-                "avg": avg_score,
-                "text": r["text"],
-                "prev": r["prev"],
-                "next": r["next"],
-            })
-
-        state["query_count"] = state.get("query_count", 0) + 1
-        _log_activity(session_id, "walk",
-                      f"'{query[:40]}' -> primary={len(result['primary'])} missed={len(result['missed'])}",
-                      elapsed_ms)
-
-        result["elapsed_ms"] = elapsed_ms
-        result["header"] = (f"Walk [primary+walk-hop, temp={temperature:.2f}]: "
-                            f"{len(result['primary'])} primary + {len(result['missed'])} missed from "
-                            f"'{state['cartridge_name']}' ({elapsed_ms:.0f}ms)")
-
-    except Exception as e:
-        log.error(f"Walk error: {e}")
-        result["error"] = f"Walk error: {e}"
-
-    return result
-
-
-def _format_walk_text(result: dict, walk_min_hits: int) -> str:
-    """Format a walk_associate_core result dict as the documented MCP text response.
-
-    Keeps the wire format byte-stable so existing MCP-text consumers
-    (the API spec doc's worked example, smoke_walk_associate.py, the
-    client example parser regex, Mempack agents) don't break.
-    """
-    if result.get("error"):
-        return result["error"]
-
-    primary_lines = ["Primary matches (direct semantic similarity):"]
-    for rank, item in enumerate(result["primary"], 1):
-        if item["score"] < 0.1:
-            continue  # display-only filter; the dict result keeps all items
-        nav = ""
-        nav_parts = []
-        if item.get("prev") is not None:
-            nav_parts.append(f"prev=#{item['prev']}")
-        if item.get("next") is not None:
-            nav_parts.append(f"next=#{item['next']}")
-        if nav_parts:
-            nav = f" [{' '.join(nav_parts)}]"
-        primary_lines.append(
-            f"#{rank} (idx:{item['idx']}) [{item['score']:.3f}]{nav} {item['text']}"
-        )
-
-    missed_lines = []
-    if result["missed"]:
-        temp = result.get("temperature", 0.0)
-        temp_label = f", temperature={temp:.1f}" if temp > 0 else ""
-        missed_lines.append(
-            f"\nYou may have missed (walked-to {walk_min_hits}+ times via primary{temp_label}):"
-        )
-        for rank, item in enumerate(result["missed"], 1):
-            nav = ""
-            nav_parts = []
-            if item.get("prev") is not None:
-                nav_parts.append(f"prev=#{item['prev']}")
-            if item.get("next") is not None:
-                nav_parts.append(f"next=#{item['next']}")
-            if nav_parts:
-                nav = f" [{' '.join(nav_parts)}]"
-            missed_lines.append(
-                f"#{rank} (idx:{item['idx']}) [hits={item['hits']} avg={item['avg']:.3f}]{nav} {item['text']}"
-            )
-
-    return result["header"] + "\n" + "\n".join(primary_lines) + "\n".join(missed_lines)
-
-
-@mcp.tool()
-def walk_associate(
-    query: str,
-    top_k: int = 10,
-    walk_top_k: int = 0,
-    walk_min_hits: int = 2,
-    walk_max_show: int = 10,
-    temperature: float = 0.0,
-    session_id: str = "",
-) -> str:
-    """Walk the substrate from a seed query to surface associations beyond direct matches.
-
-    Unlike memory_search which returns only the top-K direct semantic matches,
-    walk_associate additionally re-queries from each primary result's own embedding
-    and surfaces items that appear in multiple of those silent re-queries -- the
-    "you may have missed" set of associations the substrate found by walking outward
-    from the seed.
-
-    Use walk_associate for:
-    - Exploratory queries ("what's adjacent to X?", "who else cares about Y?")
-    - Discovering connections between concepts you didn't directly search for
-    - Member/collaborator discovery where adjacency matters as much as direct match
-
-    Use memory_search instead for direct factual lookup ("what did the user say about X").
-
-    Args:
-        query: The seed query / concept to walk from
-        top_k: Primary results returned to the caller (default 10)
-        walk_top_k: Per-primary walk-hop neighbor count (default 0 = auto = max(top_k*3, 20)).
-            Wider walk_top_k surfaces more "may have missed" associations at the cost of more
-            compute. Independent of top_k so callers can keep result lists short while still
-            getting rich walk surfacing.
-        walk_min_hits: Minimum walk-counts to promote an item to "may have missed" (default 2)
-        walk_max_show: Maximum "may have missed" items to surface (default 10)
-        temperature: 0.0 = deterministic walk (default); 0.1-1.0 adds noise to walk-hop
-            queries for basin escape. Use 0.3-0.5 for moderate serendipity, 0.7+ for
-            high-exploration mode.
-        session_id: Session identifier (uses default session if empty)
-
-    Note: In-process callers (e.g. localhost sidecars that import membot as a
-    library) should call `walk_associate_core(...)` directly and get the typed
-    dict result. This @mcp.tool() wrapper exists for MCP/LLM hosts that need
-    the documented text format.
-    """
-    result = walk_associate_core(
-        query=query,
-        top_k=top_k,
-        walk_top_k=walk_top_k,
-        walk_min_hits=walk_min_hits,
-        walk_max_show=walk_max_show,
-        temperature=temperature,
-        session_id=session_id,
-    )
-    return _format_walk_text(result, walk_min_hits)
 
 
 # ============================================================
